@@ -90,7 +90,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         NSApp.setActivationPolicy(.accessory)
         menu.delegate = self
         statusItem.menu = menu
-        statusItem.button?.title = "Claude …"
+        statusItem.button?.title = "…"
         statusItem.button?.toolTip = "TeamClaude: connecting"
         rebuildMenu()
         refresh()
@@ -139,12 +139,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     private func updateStatusItem() {
         guard let payload = status else {
-            statusItem.button?.title = "Claude · Offline"
+            statusItem.button?.title = "Offline"
             statusItem.button?.toolTip = "TeamClaude: proxy disconnected"
             return
         }
         guard let account = lowestFableAccount(in: payload.accounts) else {
-            statusItem.button?.title = "Claude · Fable: — · Session: — · Week: —"
+            statusItem.button?.title = "Fable: — · Session: — · Week: —"
             statusItem.button?.toolTip = "TeamClaude: no Fable quota data available"
             return
         }
@@ -153,8 +153,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         let fable = percent(quota?.unified7dFable)
         let session = percent(quota?.unified5h)
         let weekly = percent(quota?.unified7d)
-        let reset = compactReset(quota?.unified7dFableReset?.value)
-        statusItem.button?.title = "Claude · Fable: \(fable) \(reset) · Session: \(session) · Week: \(weekly)"
+        let fableReset = resetSuffix(quota?.unified7dFableReset?.value)
+        let sessionReset = resetSuffix(quota?.unified5hReset?.value)
+        let weeklyReset = resetSuffix(quota?.unified7dReset?.value)
+        statusItem.button?.title = "Fable: \(fable) \(fableReset) · Session: \(session) \(sessionReset) · Week: \(weekly) \(weeklyReset)"
         statusItem.button?.toolTip = "TeamClaude: lowest Fable usage is \(account.name)"
     }
 
@@ -254,13 +256,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         return "\(max(0, min(100, Int((used * 100).rounded()))))%"
     }
 
-    private func compactReset(_ date: Date?) -> String {
-        guard let date else { return "reset unknown" }
-        if date <= Date() { return "reset due" }
-        // Use the same formatter as the quota rows below. The old status-bar
-        // formatter rounded partial days up with ceil(), so 6.x days appeared
-        // as 7d here while the dropdown correctly displayed 6d.
-        return "resets \(relative(date))"
+    private func resetSuffix(_ date: Date?) -> String {
+        guard let date else { return "(?)" }
+        if date <= Date() { return "(due)" }
+        // The same relative formatter powers the dropdown rows. Trim its
+        // leading "in" for the denser status-bar form: "in 6d" → "(6d)".
+        let value = relative(date)
+        let compact = value.hasPrefix("in ") ? String(value.dropFirst(3)) : value
+        return "(\(compact))"
     }
 
     private func quotaDetails(_ account: Account) -> [String] {
