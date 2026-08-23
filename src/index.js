@@ -22,6 +22,10 @@ import { autoUpdate, checkForUpdate, currentVersion, runUpdate, installKind, PKG
 import { renderStatus } from './status-renderer.js';
 import { buildClaudeEnvLines, encodePinComponent } from './claude-env.js';
 import { serviceKind, installService, uninstallService, serviceStatus, renderService, logPath } from './service.js';
+import {
+  menubarKind, installMenubar, uninstallMenubar, menubarStatus,
+  renderMenubar, menubarLogPath,
+} from './menubar.js';
 import { formatTerminalTitle, titleSequence, TITLE_STACK_PUSH, TITLE_STACK_POP } from './terminal-title.js';
 import { getUpstreamProxy, describeProxy } from './upstream-proxy.js';
 
@@ -89,6 +93,10 @@ switch (command) {
     break;
   case 'service':
     await serviceCommand();
+    process.exit(0);
+    break;
+  case 'menubar':
+    await menubarCommand();
     process.exit(0);
     break;
   case 'probe':
@@ -1179,6 +1187,45 @@ async function serviceCommand() {
   }
 }
 
+// ── macOS menu bar ─────────────────────────────────────────
+
+async function menubarCommand() {
+  const sub = args[1] || 'status';
+  if (!menubarKind()) {
+    console.error(`teamclaude menubar: the menu-bar app requires macOS (running on ${process.platform})`);
+    process.exit(1);
+  }
+
+  switch (sub) {
+    case 'install': {
+      const config = await loadOrCreateConfig();
+      const res = await installMenubar({ port: config.proxy.port, proxyLog: logPath() });
+      if (!res.ok) { console.error(`teamclaude menubar install failed: ${res.error}`); process.exit(1); }
+      break;
+    }
+    case 'uninstall': {
+      const res = await uninstallMenubar();
+      if (!res.ok) { console.error(`teamclaude menubar uninstall failed: ${res.error}`); process.exit(1); }
+      break;
+    }
+    case 'print': {
+      const config = await loadOrCreateConfig();
+      process.stdout.write(renderMenubar({ port: config.proxy.port, proxyLog: logPath() }));
+      break;
+    }
+    case 'status': {
+      const status = await menubarStatus();
+      console.log(`Menu bar: ${status.installed ? status.binary : 'not installed'}`);
+      console.log(`State:    ${status.running ? `running${status.pid ? ` (pid ${status.pid})` : ''}` : status.detail}`);
+      console.log(`Logs:     ${menubarLogPath()}`);
+      break;
+    }
+    default:
+      console.error('Usage: teamclaude menubar <install|uninstall|status|print>');
+      process.exit(1);
+  }
+}
+
 // ── probe ───────────────────────────────────────────────────
 
 async function probeCommand() {
@@ -1506,6 +1553,9 @@ Commands:
                       restarts on its own: install | uninstall | status | print
                       (LaunchAgent on macOS, systemd --user unit on Linux;
                       'print' writes the unit to stdout without touching anything)
+  menubar <sub>       Install the native macOS menu-bar status app:
+                      install | uninstall | status | print. It shows quota,
+                      active sessions, account state, and switches accounts
   status [--json]     Show rich proxy/account/probe status (live)
                       Use --color=always|never to control ANSI colors
   attach              Open the live dashboard against a running server; s

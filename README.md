@@ -44,6 +44,7 @@ Already logged into Claude Code? `teamclaude import` takes its credentials inste
 ```bash
 teamclaude accounts          # accounts with tier and token status
 teamclaude status            # live proxy status, needs a running server
+teamclaude menubar install   # native macOS status menu, starts at login
 teamclaude disable <name>    # pause an account without removing it
 teamclaude priority <name> 1 # rotation order, lower = preferred
 teamclaude alias --install   # make plain `claude` go through the proxy

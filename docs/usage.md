@@ -132,6 +132,18 @@ teamclaude help              # Show all commands
 
 `teamclaude attach` opens the dashboard itself against a server that is already running, which is how you get interactive control back when the proxy runs as a background service. It polls the same status endpoint every second and can do the two things the control plane exposes: `s` switches account, `R` reloads config. Settings editing, quota probing and the request activity stream stay in the server's own TUI — they need state that only that process has. When contact with the server drops, the header marker turns from `▲` to `▼` and what is on screen is the last snapshot, not the current state.
 
+### macOS menu bar
+
+On macOS, install the small native status menu with:
+
+```bash
+teamclaude menubar install
+```
+
+The menu-bar label shows the active account's remaining five-hour quota (`TC 44%`). Open it to see every account's session, weekly, Sonnet, and Fable usage, account state, and active session count. Clicking an account calls the same runtime switch endpoint as `teamclaude switch`; it does not rewrite the config. The menu refreshes every ten seconds, refreshes immediately when opened, and clearly shows when the proxy is disconnected.
+
+The installer compiles the Swift source included with TeamClaude using Apple's command-line tools, places the helper under `~/Library/Application Support/TeamClaude`, and registers a per-user LaunchAgent so it starts at login. It does not install a framework or Electron runtime. Quitting the menu app does not stop the proxy, and launchd does not reopen it until the next login. Use `teamclaude menubar install` again to reopen or update it, `teamclaude menubar status` to inspect it, and `teamclaude menubar uninstall` to remove the helper and LaunchAgent.
+
 ![teamclaude status output](assets/status-redacted.png)
 
 ## Auto-update
