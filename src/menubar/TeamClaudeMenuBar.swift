@@ -258,7 +258,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     private func resetSuffix(_ date: Date?) -> String {
         guard let date else { return "(?)" }
-        if date <= Date() { return "(due)" }
+        let seconds = date.timeIntervalSinceNow
+        if seconds <= 0 { return "(due)" }
+        if seconds < 86_400 {
+            // Truncate only the unseen seconds, keeping at least one minute for
+            // a future reset so the countdown never reads "0h 0m" prematurely.
+            let totalMinutes = max(1, Int(seconds / 60))
+            return "(\(totalMinutes / 60)h \(totalMinutes % 60)m)"
+        }
         // The same relative formatter powers the dropdown rows. Trim its
         // leading "in" for the denser status-bar form: "in 6d" → "(6d)".
         let value = relative(date)
