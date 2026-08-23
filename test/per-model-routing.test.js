@@ -88,14 +88,16 @@ test('selection spends the account whose GOVERNING weekly resets soonest', () =>
   assert.equal(am._pickBestAvailable(null, FABLE).name, 'b', 'Fable spends soonest Fable weekly');
 });
 
-test('Opus prefers an equal-priority account whose Fable quota is spent', () => {
-  const am = new AccountManager([oauth('fable-ready'), oauth('fable-spent')], 0.98);
-  const ready = am.accounts[0].quota, spent = am.accounts[1].quota;
-  ready.unified5h = 0.1; ready.unified7d = 0.1; ready.unified7dFable = 0.2;
-  spent.unified5h = 0.1; spent.unified7d = 0.1; spent.unified7dFable = 1.0;
+test('Opus and Sonnet prefer an equal-priority account whose Fable quota is spent', () => {
+  for (const model of [OPUS, SONNET]) {
+    const am = new AccountManager([oauth('fable-ready'), oauth('fable-spent')], 0.98);
+    const ready = am.accounts[0].quota, spent = am.accounts[1].quota;
+    ready.unified5h = 0.1; ready.unified7d = 0.1; ready.unified7dFable = 0.2;
+    spent.unified5h = 0.1; spent.unified7d = 0.1; spent.unified7dFable = 1.0;
 
-  assert.equal(am.getActiveAccount(null, OPUS).name, 'fable-spent');
-  assert.equal(am.getActiveAccount(null, FABLE).name, 'fable-ready');
+    assert.equal(am.getActiveAccount(null, model).name, 'fable-spent', model);
+    assert.equal(am.getActiveAccount(null, FABLE).name, 'fable-ready');
+  }
 });
 
 test('Fable preservation falls back when spent accounts cannot serve Opus', () => {
