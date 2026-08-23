@@ -90,7 +90,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         NSApp.setActivationPolicy(.accessory)
         menu.delegate = self
         statusItem.menu = menu
-        statusItem.button?.title = "TC …"
+        statusItem.button?.title = "Claude …"
         statusItem.button?.toolTip = "TeamClaude: connecting"
         rebuildMenu()
         refresh()
@@ -139,19 +139,23 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     private func updateStatusItem() {
         guard let payload = status else {
-            statusItem.button?.title = "TC —"
+            statusItem.button?.title = "Claude · Offline"
             statusItem.button?.toolTip = "TeamClaude: proxy disconnected"
             return
         }
-        let current = payload.accounts.first { $0.name == payload.currentAccount }
-        if let used = current?.quota?.unified5h {
-            let remaining = max(0, min(100, Int(((1 - used) * 100).rounded())))
-            statusItem.button?.title = "TC \(remaining)%"
-            statusItem.button?.toolTip = "TeamClaude: \(current?.name ?? "no active account"), \(remaining)% session quota remaining"
-        } else {
-            statusItem.button?.title = "TC"
-            statusItem.button?.toolTip = "TeamClaude: \(current?.name ?? "no active account")"
+        guard let account = lowestFableAccount(in: payload.accounts) else {
+            statusItem.button?.title = "Claude · Fable: — · Session: — · Week: —"
+            statusItem.button?.toolTip = "TeamClaude: no Fable quota data available"
+            return
         }
+
+        let quota = account.quota
+        let fable = percent(quota?.unified7dFable)
+        let session = percent(quota?.unified5h)
+        let weekly = percent(quota?.unified7d)
+        let reset = compactReset(quota?.unified7dFableReset?.value)
+        statusItem.button?.title = "Claude · Fable: \(fable) \(reset) · Session: \(session) · Week: \(weekly)"
+        statusItem.button?.toolTip = "TeamClaude: lowest Fable usage is \(account.name)"
     }
 
     private func rebuildMenu() {
@@ -181,9 +185,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             menu.addItem(empty)
         }
 
+        let lowestFableName = lowestFableAccount(in: payload.accounts)?.name
         for account in payload.accounts {
             let isCurrent = account.name == payload.currentAccount
-            let accountItem = NSMenuItem(title: accountTitle(account),
+            let accountItem = NSMenuItem(title: accountTitle(account, lowestFable: account.name == lowestFableName),
                                          action: #selector(switchAccount(_:)), keyEquivalent: "")
             accountItem.target = self
             accountItem.representedObject = account.name
@@ -225,14 +230,37 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         menu.addItem(quitItem)
     }
 
-    private func accountTitle(_ account: Account) -> String {
+    private func accountTitle(_ account: Account, lowestFable: Bool) -> String {
         var pieces = [account.name]
         if let org = account.orgName, !org.isEmpty { pieces.append("(\(org))") }
+        if lowestFable { pieces.append("· lowest Fable") }
         if account.disabled == true { pieces.append("— disabled") }
         else if let state = account.status, state != "active" { pieces.append("— \(state)") }
         if let sessions = account.sessions, sessions > 0 { pieces.append("· \(sessions) session\(sessions == 1 ? "" : "s")") }
         if switchingAccount == account.name { pieces.append("· switching…") }
         return pieces.joined(separator: " ")
+    }
+
+    private func lowestFableAccount(in accounts: [Account]) -> Account? {
+        accounts
+            .filter { $0.quota?.unified7dFable != nil }
+            .min {
+                ($0.quota?.unified7dFable ?? .infinity) < ($1.quota?.unified7dFable ?? .infinity)
+            }
+    }
+
+    private func percent(_ used: Double?) -> String {
+        guard let used else { return "—" }
+        return "\(max(0, min(100, Int((used * 100).rounded()))))%"
+    }
+
+    private func compactReset(_ date: Date?) -> String {
+        guard let date else { return "reset unknown" }
+        let seconds = date.timeIntervalSinceNow
+        if seconds <= 0 { return "reset due" }
+        if seconds < 3_600 { return "resets in \(max(1, Int(ceil(seconds / 60))))m" }
+        if seconds < 86_400 { return "resets in \(max(1, Int(ceil(seconds / 3_600))))h" }
+        return "resets in \(max(1, Int(ceil(seconds / 86_400))))d"
     }
 
     private func quotaDetails(_ account: Account) -> [String] {

@@ -140,7 +140,7 @@ On macOS, install the small native status menu with:
 teamclaude menubar install
 ```
 
-The menu-bar label shows the active account's remaining five-hour quota (`TC 44%`). Open it to see every account's session, weekly, Sonnet, and Fable usage, account state, and active session count. Clicking an account calls the same runtime switch endpoint as `teamclaude switch`; it does not rewrite the config. The menu refreshes every ten seconds, refreshes immediately when opened, and clearly shows when the proxy is disconnected.
+The menu-bar label finds the account with the lowest known Fable usage and shows that account's Fable reset, session usage, and weekly usage (`Claude · Fable: 40% resets in 3d · Session: 90% · Week: 10%`). Open it to see every account's session, weekly, Sonnet, and Fable usage, account state, and active session count; the account supplying the summary is marked `lowest Fable`. Clicking an account calls the same runtime switch endpoint as `teamclaude switch`; it does not rewrite the config. The menu refreshes every ten seconds, refreshes immediately when opened, and clearly shows when the proxy is disconnected.
 
 The installer compiles the Swift source included with TeamClaude using Apple's command-line tools, places the helper under `~/Library/Application Support/TeamClaude`, and registers a per-user LaunchAgent so it starts at login. It does not install a framework or Electron runtime. Quitting the menu app does not stop the proxy, and launchd does not reopen it until the next login. Use `teamclaude menubar install` again to reopen or update it, `teamclaude menubar status` to inspect it, and `teamclaude menubar uninstall` to remove the helper and LaunchAgent.
 
