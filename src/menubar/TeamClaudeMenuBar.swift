@@ -256,11 +256,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     private func compactReset(_ date: Date?) -> String {
         guard let date else { return "reset unknown" }
-        let seconds = date.timeIntervalSinceNow
-        if seconds <= 0 { return "reset due" }
-        if seconds < 3_600 { return "resets in \(max(1, Int(ceil(seconds / 60))))m" }
-        if seconds < 86_400 { return "resets in \(max(1, Int(ceil(seconds / 3_600))))h" }
-        return "resets in \(max(1, Int(ceil(seconds / 86_400))))d"
+        if date <= Date() { return "reset due" }
+        // Use the same formatter as the quota rows below. The old status-bar
+        // formatter rounded partial days up with ceil(), so 6.x days appeared
+        // as 7d here while the dropdown correctly displayed 6d.
+        return "resets \(relative(date))"
     }
 
     private func quotaDetails(_ account: Account) -> [String] {
