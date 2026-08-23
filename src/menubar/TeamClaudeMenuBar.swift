@@ -258,17 +258,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     private func resetSuffix(_ date: Date?) -> String {
         guard let date else { return "(?)" }
-        let seconds = date.timeIntervalSinceNow
-        if seconds <= 0 { return "(due)" }
-        if seconds < 86_400 {
-            // Truncate only the unseen seconds, keeping at least one minute for
-            // a future reset so the countdown never reads "0h 0m" prematurely.
-            let totalMinutes = max(1, Int(seconds / 60))
-            return "(\(totalMinutes / 60)h \(totalMinutes % 60)m)"
-        }
-        // The same relative formatter powers the dropdown rows. Trim its
-        // leading "in" for the denser status-bar form: "in 6d" → "(6d)".
-        let value = relative(date)
+        // Trim the dropdown formatter's leading "in" for the denser status-bar
+        // form: "in 2h 42m" → "(2h 42m)", "in 6d" → "(6d)".
+        let value = resetRelative(date)
         let compact = value.hasPrefix("in ") ? String(value.dropFirst(3)) : value
         return "(\(compact))"
     }
@@ -287,8 +279,20 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         guard let used else { return }
         let percent = max(0, min(100, Int((used * 100).rounded())))
         var text = "\(label): \(percent)% used"
-        if let reset, reset > Date() { text += " · resets \(relative(reset))" }
+        if let reset, reset > Date() { text += " · resets \(resetRelative(reset))" }
         rows.append(text)
+    }
+
+    private func resetRelative(_ date: Date) -> String {
+        let seconds = date.timeIntervalSinceNow
+        if seconds <= 0 { return "due" }
+        if seconds < 86_400 {
+            // Truncate only the unseen seconds, keeping at least one minute for
+            // a future reset so the countdown never reads "in 0h 0m" early.
+            let totalMinutes = max(1, Int(seconds / 60))
+            return "in \(totalMinutes / 60)h \(totalMinutes % 60)m"
+        }
+        return relative(date)
     }
 
     @objc private func switchAccount(_ sender: NSMenuItem) {
