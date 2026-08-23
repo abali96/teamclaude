@@ -321,8 +321,7 @@ export class AccountManager {
       if (pinned && this._isAvailable(pinned, model, advisorModel) && !exclude?.has(pinIdx)) {
         // Mirror _select's priority preemption so an operator's priority order
         // still wins over a session's stickiness.
-        const betterExists = this.accounts.some(a =>
-          this._isAvailable(a, model, advisorModel) && !exclude?.has(a.index) && (a.priority || 0) < (pinned.priority || 0));
+        const betterExists = this._preemptedBy(pinned, model, advisorModel, exclude);
         if (!betterExists) return pinned;
       }
     }
@@ -331,12 +330,13 @@ export class AccountManager {
 
   /** Best-available biased toward the fewest active sessions, so new sessions
    * spread across equal-priority accounts instead of funnelling onto one. Order:
-   * priority → fewest active sessions → fewest in-flight → soonest weekly reset
-   * (the existing tiebreak). */
+   * priority → preserve Fable quota → fewest active sessions → fewest
+   * in-flight → soonest weekly reset (the existing tiebreak). */
   _pickLeastLoaded(exclude = null, model = null, advisorModel = null) {
     const now = Date.now();
     let best = null;
     let bestPriority = Infinity;
+    let bestFableRank = Infinity;
     let bestSessions = Infinity;
     let bestInFlight = Infinity;
     let bestReset = Infinity;
@@ -344,15 +344,18 @@ export class AccountManager {
       if (exclude?.has(account.index)) continue;
       if (!this._isAvailable(account, model, advisorModel)) continue;
       const priority = account.priority || 0;
+      const fableRank = this._fablePreservationRank(account, model);
       const sessions = this.sessionTracker.activeCountFor(account.index, now);
       const inFlight = account.inFlight || 0;
       const reset = this._governingWeeklyReset(account, model) || -Infinity;
       if (priority < bestPriority
-        || (priority === bestPriority && sessions < bestSessions)
-        || (priority === bestPriority && sessions === bestSessions && inFlight < bestInFlight)
-        || (priority === bestPriority && sessions === bestSessions && inFlight === bestInFlight && reset < bestReset)) {
+        || (priority === bestPriority && fableRank < bestFableRank)
+        || (priority === bestPriority && fableRank === bestFableRank && sessions < bestSessions)
+        || (priority === bestPriority && fableRank === bestFableRank && sessions === bestSessions && inFlight < bestInFlight)
+        || (priority === bestPriority && fableRank === bestFableRank && sessions === bestSessions && inFlight === bestInFlight && reset < bestReset)) {
         best = account;
         bestPriority = priority;
+        bestFableRank = fableRank;
         bestSessions = sessions;
         bestInFlight = inFlight;
         bestReset = reset;
@@ -414,10 +417,9 @@ export class AccountManager {
     if (pinned && this._isAvailable(pinned, model)) return pinned.index;
     const current = this.accounts[this.currentIndex];
     if (current && this._isAvailable(current, model)) {
-      // Mirror getActiveAccount's priority preemption: a strictly higher-priority
-      // available account wins over a healthy current one; same tier stays put.
-      const better = this.accounts.some(a =>
-        this._isAvailable(a, model) && (a.priority || 0) < (current.priority || 0));
+      // Mirror getActiveAccount's preemption rules: explicit priority wins, then
+      // non-Fable requests may leave an account with Fable headroom.
+      const better = this._preemptedBy(current, model);
       if (!better) return current.index;
     }
     const best = this._pickBestAvailable(null, model);
@@ -580,17 +582,30 @@ export class AccountManager {
     return true;
   }
 
+  /** Rank equal-priority accounts for a non-Fable request. A spent Fable bucket
+   * ranks first so shared 5-hour quota that can still run Fable is preserved.
+   * Unknown Fable quota stays neutral until a response or probe fills it in. */
+  _fablePreservationRank(account, model) {
+    if (!model || this._weeklyBucketFor(model) === 'unified7dFable') return 0;
+    const fable = account.quota.unified7dFable;
+    return fable != null && fable >= this.switchThreshold ? 0 : 1;
+  }
+
   /**
-   * The available account that would preempt `account` under the priority rule,
-   * or null. A strictly lower priority value wins; within the same tier we stay
-   * put, so the common case (every account at the default priority 0) never
-   * thrashes. Shared by _select, which enforces it, and eligibility(), which
-   * reports it — one predicate so the answer cannot drift from the behaviour.
+   * The available account that should preempt `account`, or null. Explicit
+   * priority wins first. Within the same tier, non-Fable requests leave an
+   * account with Fable headroom when an account with spent Fable quota can serve
+   * them. Otherwise we stay put to avoid cache churn.
    */
   _preemptedBy(account, model = null, advisorModel = null, exclude = null) {
-    return this.accounts.find(a => this._isAvailable(a, model, advisorModel)
-      && !exclude?.has(a.index)
-      && (a.priority || 0) < (account.priority || 0)) || null;
+    const priority = account.priority || 0;
+    const fableRank = this._fablePreservationRank(account, model);
+    return this.accounts.find(a => {
+      if (!this._isAvailable(a, model, advisorModel) || exclude?.has(a.index)) return false;
+      const candidatePriority = a.priority || 0;
+      return candidatePriority < priority
+        || (candidatePriority === priority && this._fablePreservationRank(a, model) < fableRank);
+    }) || null;
   }
 
   /**
@@ -944,9 +959,10 @@ export class AccountManager {
   /**
    * Pick the best available account by selection order, WITHOUT mutating state:
    *   1. lowest `priority` value (operator-controlled; default 0, lower = preferred)
-   *   2. then the account with no known weekly limit — using it lets us
+   *   2. for non-Fable requests, an account whose Fable quota is spent
+   *   3. then the account with no known weekly limit — using it lets us
    *      discover its quota
-   *   3. then the account whose weekly limit expires soonest: that quota is
+   *   4. then the account whose weekly limit expires soonest: that quota is
    *      closest to refreshing, so spending it first preserves accounts whose
    *      weekly window resets further out.
    * With all priorities at the default 0, this reduces to the weekly-reset
@@ -955,6 +971,7 @@ export class AccountManager {
   _pickBestAvailable(exclude = null, model = null, advisorModel = null) {
     let best = null;
     let bestPriority = Infinity;
+    let bestFableRank = Infinity;
     let bestReset = Infinity;
 
     for (let i = 0; i < this.accounts.length; i++) {
@@ -966,14 +983,17 @@ export class AccountManager {
       if (!this._isAvailable(account, model, advisorModel)) continue;
 
       const priority = account.priority || 0;
+      const fableRank = this._fablePreservationRank(account, model);
       // Rank by the reset of the weekly bucket that governs THIS model (Fable and
       // Sonnet have their own), so a Fable request spends the account whose Fable
       // window refreshes soonest while preserving accounts that reset later for
       // Opus/Sonnet. Unknown reset sorts first so we probe and fill it in.
       const weeklyReset = this._governingWeeklyReset(account, model) || -Infinity;
       if (priority < bestPriority ||
-          (priority === bestPriority && weeklyReset < bestReset)) {
+          (priority === bestPriority && fableRank < bestFableRank) ||
+          (priority === bestPriority && fableRank === bestFableRank && weeklyReset < bestReset)) {
         bestPriority = priority;
+        bestFableRank = fableRank;
         bestReset = weeklyReset;
         best = account;
       }

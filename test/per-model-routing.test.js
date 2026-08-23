@@ -88,6 +88,45 @@ test('selection spends the account whose GOVERNING weekly resets soonest', () =>
   assert.equal(am._pickBestAvailable(null, FABLE).name, 'b', 'Fable spends soonest Fable weekly');
 });
 
+test('Opus prefers an equal-priority account whose Fable quota is spent', () => {
+  const am = new AccountManager([oauth('fable-ready'), oauth('fable-spent')], 0.98);
+  const ready = am.accounts[0].quota, spent = am.accounts[1].quota;
+  ready.unified5h = 0.1; ready.unified7d = 0.1; ready.unified7dFable = 0.2;
+  spent.unified5h = 0.1; spent.unified7d = 0.1; spent.unified7dFable = 1.0;
+
+  assert.equal(am.getActiveAccount(null, OPUS).name, 'fable-spent');
+  assert.equal(am.getActiveAccount(null, FABLE).name, 'fable-ready');
+});
+
+test('Fable preservation falls back when spent accounts cannot serve Opus', () => {
+  const am = new AccountManager([oauth('fable-ready'), oauth('fable-spent')], 0.98);
+  const ready = am.accounts[0].quota, spent = am.accounts[1].quota;
+  ready.unified5h = 0.1; ready.unified7d = 0.1; ready.unified7dFable = 0.2;
+  spent.unified5h = 0.99; spent.unified7d = 0.1; spent.unified7dFable = 1.0;
+
+  assert.equal(am.getActiveAccount(null, OPUS).name, 'fable-ready');
+});
+
+test('explicit priority wins over Fable preservation', () => {
+  const am = new AccountManager([
+    oauth('preferred', { priority: 0 }),
+    oauth('fable-spent', { priority: 1 }),
+  ], 0.98);
+  am.accounts[0].quota.unified7dFable = 0.2;
+  am.accounts[1].quota.unified7dFable = 1.0;
+
+  assert.equal(am.getActiveAccount(null, OPUS).name, 'preferred');
+});
+
+test('unknown Fable quota keeps the existing reset-time selection', () => {
+  const am = new AccountManager([oauth('later'), oauth('sooner')], 0.98);
+  const now = Date.now();
+  am.accounts[0].quota.unified7dReset = now + 600_000;
+  am.accounts[1].quota.unified7dReset = now + 60_000;
+
+  assert.equal(am._pickBestAvailable(null, OPUS).name, 'sooner');
+});
+
 // ── streaming model peek (shown immediately) ──────────────────
 
 test('the top-level model resolves from the first streamed chunk, before the full body', () => {

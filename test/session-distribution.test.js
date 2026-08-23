@@ -67,6 +67,26 @@ test('distribution on: priority still wins over session load-balancing', () => {
   }
 });
 
+test('distribution on: Opus preserves Fable quota before balancing session load', () => {
+  const am = mgr(['fable-ready', 'fable-spent'], { distributeSessions: true });
+  am.accounts[0].quota.unified7dFable = 0.2;
+  am.accounts[1].quota.unified7dFable = 1.0;
+  am.recordSession('existing', 1);
+
+  const account = am.getActiveAccount(null, 'claude-opus-4-6', null, 'new-session');
+  assert.equal(account.name, 'fable-spent');
+});
+
+test('distribution on: an Opus session leaves a Fable-capable account when a spent account is available', () => {
+  const am = mgr(['fable-ready', 'fable-spent'], { distributeSessions: true });
+  am.accounts[0].quota.unified7dFable = 0.2;
+  am.accounts[1].quota.unified7dFable = 1.0;
+  am.recordSession('opus-session', 0);
+
+  const account = am.getActiveAccount(null, 'claude-opus-4-6', null, 'opus-session');
+  assert.equal(account.name, 'fable-spent');
+});
+
 test('distribution on: a pinned session whose account is exhausted re-routes', () => {
   const am = mgr(['a', 'b'], { distributeSessions: true });
   am.recordSession('sess-1', 0);
