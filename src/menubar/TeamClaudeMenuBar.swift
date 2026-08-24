@@ -286,13 +286,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private func resetRelative(_ date: Date) -> String {
         let seconds = date.timeIntervalSinceNow
         if seconds <= 0 { return "due" }
+        // Truncate only the unseen seconds, keeping at least one minute for a
+        // future reset so the countdown never reaches zero prematurely.
+        let totalMinutes = max(1, Int(seconds / 60))
         if seconds < 86_400 {
-            // Truncate only the unseen seconds, keeping at least one minute for
-            // a future reset so the countdown never reads "in 0h 0m" early.
-            let totalMinutes = max(1, Int(seconds / 60))
             return "in \(totalMinutes / 60)h \(totalMinutes % 60)m"
         }
-        return relative(date)
+        let totalHours = totalMinutes / 60
+        return "in \(totalHours / 24)d \(totalHours % 24)h"
     }
 
     @objc private func switchAccount(_ sender: NSMenuItem) {
@@ -338,12 +339,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     @objc private func quit() {
         NSApp.terminate(nil)
-    }
-
-    private func relative(_ date: Date) -> String {
-        let formatter = RelativeDateTimeFormatter()
-        formatter.unitsStyle = .abbreviated
-        return formatter.localizedString(for: date, relativeTo: Date())
     }
 
     private func readable(_ error: Error) -> String {
