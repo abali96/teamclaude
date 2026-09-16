@@ -16,6 +16,7 @@ export const MENUBAR_LABEL = 'com.karpeleslab.teamclaude.menubar';
 export const MENUBAR_BINARY = 'TeamClaudeMenuBar';
 
 const SOURCE_PATH = fileURLToPath(new URL('./menubar/TeamClaudeMenuBar.swift', import.meta.url));
+/** @param {unknown} value */
 const xmlEscape = (value) => String(value)
   .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 const guiDomain = (uid = process.getuid?.() ?? 0) => `gui/${uid}`;
@@ -40,6 +41,7 @@ export function menubarLogPath(home = homedir()) {
   return join(home, 'Library', 'Logs', 'teamclaude-menubar.log');
 }
 
+/** @param {{binary: string, port: number, proxyLog: string, log: string}} options */
 export function renderMenubarLaunchAgent({
   binary, port, proxyLog, log,
 }) {
@@ -69,7 +71,11 @@ ${args.map(a => `    <string>${xmlEscape(a)}</string>`).join('\n')}
 `;
 }
 
-/** Run a command without a shell, returning a small serializable result. */
+/**
+ * Run a command without a shell, returning a small serializable result.
+ * @param {string} cmd
+ * @param {string[]} args
+ */
 function runCommand(cmd, args) {
   const result = spawnSync(cmd, args, { encoding: 'utf8' });
   return {
@@ -79,11 +85,14 @@ function runCommand(cmd, args) {
   };
 }
 
+/** @param {number} ms */
+const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
 export async function installMenubar({
   kind = menubarKind(), platform = process.platform, home = homedir(), port = 3456,
   proxyLog = join(home, 'Library', 'Logs', 'teamclaude.log'),
   source = SOURCE_PATH, run = runCommand, log = console.log,
-  pause = (ms) => new Promise(resolve => setTimeout(resolve, ms)),
+  pause = wait,
 } = {}) {
   if (!kind) return { ok: false, error: `The menu-bar app requires macOS (running on ${platform})` };
 

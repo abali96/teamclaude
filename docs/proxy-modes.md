@@ -26,6 +26,8 @@ MITM mode launches claude pointed at TeamClaude as an **HTTPS forward proxy** (`
 
 Because the request is buffered, the retry is transparent to claude. Client token refreshes (`/v1/oauth/token`), Remote Control (`/v1/code/*`) and claude.ai attachment transfers (`/api/oauth/files/*`, `/api/oauth/file_upload`) are passed through with the client's own credential, since they are bound to the paired identity and would 403 under a rotated token. Any host other than the upstream is blind-tunnelled. The server accepts *both* base-URL and proxy clients at once, so instances launched with and without `--no-mitm` can share one server.
 
+A pool with Codex accounts also intercepts `chatgpt.com`, which is where ChatGPT Desktop talks to as well. On a machine running that app, set `proxy.terminalOnly` to `true` to tunnel that host untouched: the terminal Codex CLI keeps reaching the pool through its explicit `/backend-api/codex` base URL, and the desktop app keeps its own login.
+
 ### Trust model
 
 - The CA is generated locally, stored in the config dir, and trusted **only** by the claude process you launch via `teamclaude run` (through `NODE_EXTRA_CA_CERTS`) — it is **never** added to your system trust store. The leaf private key is `0600`; the CA private key is never written to disk.
@@ -64,11 +66,22 @@ restart.
   silently in force.
 - `NO_PROXY` (or `noProxy`) exempts hosts by suffix; `"upstreamProxy": false`
   ignores the environment entirely.
+- **A proxy that is this server is refused.** `teamclaude env` exports
+  `HTTPS_PROXY` pointing at TeamClaude, so a server or CLI started from that
+  shell would inherit itself as its egress proxy — every upstream call would
+  re-enter the proxy and be answered for whichever account it selected, silently
+  (a usage probe would then store that one account's quota under all of them).
+  A value whose address is our own listener is dropped, whether it came from the
+  environment or the config, and the startup line and the TUI row say so.
 - **TLS stays end-to-end.** The tunnel is a plain `CONNECT`; the proxy sees
   ciphertext only, and certificate verification is unchanged. A proxy that
   intercepts TLS needs its CA in `NODE_EXTRA_CA_CERTS`.
 - SOCKS proxies are not supported — only HTTP `CONNECT`. A `socks5://` value is
-  rejected at startup rather than failing later at connect time.
+  rejected at startup rather than failing later at connect time. So is an
+  `https://` proxy URL: TeamClaude does not speak TLS *to* the proxy, and
+  accepting the scheme would send the `CONNECT` (credentials included) in
+  plaintext to port 443. Write `http://host:port` — the tunnel through it is
+  end-to-end TLS regardless.
 
 This is a property of the **network**, not a routing policy: when set, it is
 simply how this machine reaches Anthropic. That is what separates it from sx.org
@@ -80,6 +93,8 @@ Claude Code connects **to**.
 ## sx.org proxy mode
 
 Off by default. Some transient `429`s key on the proxy's **outbound IP**, not the account, so rotating accounts doesn't help. To work around them, TeamClaude can route upstream requests through a residential proxy from [sx.org](https://sx.org), giving a different egress IP.
+
+No sx.org account yet? Sign up through TeamClaude's referral link, **<https://sx.org/c/ufVrLW>** — it costs you nothing extra, and the referral supports TeamClaude development.
 
 Open the TUI, press **`g`** for the settings screen, and put your sx.org API key in the **sx.org API key** row (stored in `config.sx.apiKey`). TeamClaude reuses an existing active proxy port on your sx.org account, or auto-creates a residential US one, and dials the upstream through it via HTTP `CONNECT` on **both** the reverse-proxy and MITM paths.
 
