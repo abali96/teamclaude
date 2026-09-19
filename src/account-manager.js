@@ -88,6 +88,11 @@ function resetTimestamp(value) {
 // Fallback when a per-bucket threshold table names neither the bucket nor a
 // `default` — the same value the single-number form has always used.
 export const DEFAULT_SWITCH_THRESHOLD = 0.98;
+/** Fable utilization at which an account counts as out of Fable for the
+ * preservation rule (non-Fable requests prefer such accounts). Separate from
+ * the rotation threshold: an account at 97% Fable is done with Fable in
+ * practice long before rotation bars it at 99%. */
+export const DEFAULT_FABLE_SPENT_THRESHOLD = 0.9;
 
 // Quota fields that survive a restart: utilization levels and their reset
 // windows, learned passively from upstream responses. Transient/derived state
@@ -286,7 +291,7 @@ export class AccountManager {
    * @param {Object} [opts.sessionTracker]
    * @param {Object} [opts.expiryRouting]
    */
-  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, adaptive, sessionTracker, expiryRouting } = {}) {
+  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, adaptive, sessionTracker, expiryRouting, fableSpentThreshold } = {}) {
     // How long a just-minted token is trusted against a forced refresh.
     this._forcedRefreshFloorMs = forcedRefreshFloorMs;
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
@@ -344,6 +349,7 @@ export class AccountManager {
     // as a spent family bucket does not (#276).
     this.providerCursors = new Map();
     this.switchThreshold = switchThreshold;
+    this.setFableSpentThreshold(fableSpentThreshold);
     this.setRoutes(routes);
     // Monotonic across every observation, so a stamp read under one move never
     // matches another. Live before the settings, since turning the knob on
@@ -1749,7 +1755,27 @@ export class AccountManager {
   _fablePreservationRank(account, model) {
     if (!model || this._weeklyBucketFor(model) === 'unified7dFable') return 0;
     const fable = account.quota.unified7dFable;
-    return fable != null && fable >= this.switchThreshold ? 0 : 1;
+    return fable != null && fable >= this.fableSpentCutoff ? 0 : 1;
+  }
+
+  /**
+   * The Fable utilization at which the preservation rule treats an account as
+   * out of Fable: the configured `fableSpentThreshold`, or the Fable rotation
+   * threshold if that is lower, since an account rotation already bars from
+   * Fable is spent whatever the cutoff says. Read per bucket through
+   * thresholdFor(), so the per-bucket object form of `switchThreshold` works
+   * here too (comparing against the raw value silently never matched).
+   */
+  get fableSpentCutoff() {
+    return Math.min(this.fableSpentThreshold, this.thresholdFor('unified7dFable'));
+  }
+
+  /** `fableSpentThreshold` from config, applied live on reload. Anything that is
+   * not a finite number in (0, 1] falls back to the default. */
+  setFableSpentThreshold(value) {
+    this.fableSpentThreshold = typeof value === 'number' && Number.isFinite(value) && value > 0 && value <= 1
+      ? value
+      : DEFAULT_FABLE_SPENT_THRESHOLD;
   }
 
   /**
@@ -3994,6 +4020,7 @@ export class AccountManager {
       // current account" when that account is blocked or outranked.
       defaultTarget: this._routeTarget(null),
       switchThreshold: this.effectiveThreshold,
+      fableSpentThreshold: this.fableSpentThreshold,
       // The full table when one is configured, so status output can show the
       // per-bucket values rather than only the representative number.
       switchThresholds: typeof this.switchThreshold === 'object' && this.switchThreshold
