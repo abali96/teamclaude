@@ -293,7 +293,7 @@ async function serverCommand() {
     console.error(`[TeamClaude] Bad adaptiveDistribution setting in ${getConfigPath()}: ${err.message}`);
     process.exit(1);
   }
-  const accountManager = new AccountManager(accounts, threshold, { routes: config.routes, ramp: config.stormRamp, distributeSessions: config.distributeSessions, expiryRouting: config.expiryRouting, adaptive });
+  const accountManager = new AccountManager(accounts, threshold, { routes: config.routes, ramp: config.stormRamp, distributeSessions: config.distributeSessions, expiryRouting: config.expiryRouting, adaptive, fableSpentThreshold: config.fableSpentThreshold });
   // Names the activity log's session column from Claude Code's own on-disk
   // session titles. Built whether or not the TUI runs, so a reload has one
   // object to reconfigure.
@@ -434,6 +434,9 @@ async function serverCommand() {
     // Pick up expiry-routing edits the same way, so the knob hot-applies.
     config.expiryRouting = diskConfig.expiryRouting;
     accountManager.setExpiryRouting(config.expiryRouting);
+    // Same for the Fable-preservation cutoff.
+    config.fableSpentThreshold = diskConfig.fableSpentThreshold;
+    accountManager.setFableSpentThreshold(config.fableSpentThreshold);
     config.sessionTitles = diskConfig.sessionTitles;
     sessionTitles.configure(config.sessionTitles);
     // Both are read per request off this object (server.js) and the TUI already

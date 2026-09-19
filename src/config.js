@@ -96,6 +96,7 @@ export function createDefaultConfig() {
     },
     upstream: 'https://api.anthropic.com',
     switchThreshold: 0.98,
+    fableSpentThreshold: 0.9,
     holdSeconds: 0,
     distributeSessions: false,
     sessionTitles: { enabled: false, width: 18 },

@@ -120,6 +120,49 @@ test('explicit priority wins over Fable preservation', () => {
   assert.equal(am.getActiveAccount(null, OPUS).name, 'preferred');
 });
 
+test('Fable preservation counts 90% Fable as spent by default, not only the rotation threshold', () => {
+  const am = new AccountManager([oauth('fable-ready'), oauth('fable-nearly-spent')], 0.99);
+  const ready = am.accounts[0].quota, nearly = am.accounts[1].quota;
+  ready.unified5h = 0.1; ready.unified7d = 0.1; ready.unified7dFable = 0.2;
+  nearly.unified5h = 0.1; nearly.unified7d = 0.1; nearly.unified7dFable = 0.97;
+
+  assert.equal(am.fableSpentCutoff, 0.9);
+  assert.equal(am.getActiveAccount(null, OPUS).name, 'fable-nearly-spent', '97% Fable is out of Fable for Opus');
+  // The rule never applies to Fable requests themselves: both rank equal there.
+  assert.equal(am._fablePreservationRank(am.accounts[0], FABLE), 0);
+  assert.equal(am._fablePreservationRank(am.accounts[1], FABLE), 0);
+  assert.equal(am._isAvailable(am.accounts[1], FABLE), true, '97% is still under the 99% rotation threshold');
+});
+
+test('fableSpentThreshold is configurable and hot-applied', () => {
+  const am = new AccountManager([oauth('fable-ready'), oauth('fable-half')], 0.99, { fableSpentThreshold: 0.5 });
+  const ready = am.accounts[0].quota, half = am.accounts[1].quota;
+  ready.unified5h = 0.1; ready.unified7d = 0.1; ready.unified7dFable = 0.2;
+  half.unified5h = 0.1; half.unified7d = 0.1; half.unified7dFable = 0.6;
+
+  assert.equal(am._pickBestAvailable(null, OPUS).name, 'fable-half');
+  am.setFableSpentThreshold(0.9);
+  assert.equal(am._fablePreservationRank(am.accounts[1], OPUS), 1, '60% is below a 90% cutoff');
+  am.setFableSpentThreshold('nonsense');
+  assert.equal(am.fableSpentThreshold, 0.9, 'bad value falls back to the default');
+});
+
+test('Fable preservation works with the per-bucket switchThreshold form', () => {
+  // Regression: the rank compared against the raw config value, so an object
+  // threshold made `fable >= {object}` false and the rule silently never fired.
+  const am = new AccountManager([oauth('fable-ready'), oauth('fable-spent')], { default: 0.98, unified7dFable: 0.95 });
+  const ready = am.accounts[0].quota, spent = am.accounts[1].quota;
+  ready.unified5h = 0.1; ready.unified7d = 0.1; ready.unified7dFable = 0.2;
+  spent.unified5h = 0.1; spent.unified7d = 0.1; spent.unified7dFable = 0.96;
+
+  assert.equal(am.getActiveAccount(null, OPUS).name, 'fable-spent');
+});
+
+test('a Fable rotation threshold below the cutoff governs the cutoff', () => {
+  const am = new AccountManager([oauth('a')], { default: 0.98, unified7dFable: 0.8 }, { fableSpentThreshold: 0.9 });
+  assert.equal(am.fableSpentCutoff, 0.8);
+});
+
 test('unknown Fable quota keeps the existing reset-time selection', () => {
   const am = new AccountManager([oauth('later'), oauth('sooner')], 0.98);
   const now = Date.now();
