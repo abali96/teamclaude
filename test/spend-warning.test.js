@@ -83,6 +83,32 @@ test('formatMoney renders amount and cap, and stays readable for an unknown curr
   assert.equal(formatMoney(null), 'unknown');
 });
 
+test("an exponent in no currency's minor unit is rendered as unknown, never thrown", () => {
+  // The exponent is the payload's own: one of -1 threw a RangeError out of the
+  // status line, the TUI row and the probe's "started spending" log.
+  const withExponent = (exponent) => ({ ...BILLABLE, spend: { ...BILLABLE.spend, used: { amount_minor: 4237, currency: 'USD', exponent } } });
+  for (const exponent of [-1, 101, 7, 2.5]) {
+    const spend = normalizeSpend(withExponent(exponent));
+    assert.equal(formatMoney(spend), 'unknown', `formatMoney, exponent ${exponent}`);
+    assert.match(spendLine({ quota: { spend } }, paint), /billing real money — unknown/, `spendLine, exponent ${exponent}`);
+    assert.equal(spendTag({ spend }), 'unknown', `spendTag, exponent ${exponent}`);
+    // The money cap still sees the exponent and sets no cap rather than a wrong one.
+    assert.doesNotMatch(spendLine({ quota: { spend }, maxSpend: 20 }, paint), /cap/, `cap, exponent ${exponent}`);
+  }
+  const am = new AccountManager([{ name: 'work', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 }], 0.98);
+  const said = [];
+  const realLog = console.log;
+  console.log = (m) => said.push(String(m));
+  try {
+    am.applyUsageData(0, normalizeUsagePayload({ ...withExponent(-1), limits: [] }));
+  } finally {
+    console.log = realLog;
+  }
+  assert.match(said.find(l => /started spending real money/.test(l)) ?? '', /: unknown$/);
+  // The ends of the range still render: 0 (yen) above, 6 here.
+  assert.equal(formatMoney({ usedMinor: 1234567, limitMinor: null, currency: 'USD', exponent: 6 }), '$1.234567');
+});
+
 test('the probe carries spend onto the quota and announces the transition once', () => {
   const am = new AccountManager([{ name: 'work', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 }], 0.98);
   const said = [];
@@ -141,23 +167,53 @@ test('the status screen stays silent for accounts that cannot bill', () => {
   assert.equal(/Spend/.test(out), false);
 });
 
-test('spendTag marks only what billing costs now', () => {
+test('spendTag marks only what billing costs now, and says how much once it has', () => {
   assert.equal(spendTag({ spend: normalizeSpend(BILLABLE) }), '$');
-  assert.equal(spendTag({ spend: normalizeSpend({
-    ...BILLABLE, spend: { ...BILLABLE.spend, used: { amount_minor: 1, currency: 'USD', exponent: 2 } },
-  }) }), '$!');
+  const spent = (amount_minor) => ({ spend: normalizeSpend({
+    ...BILLABLE, spend: { ...BILLABLE.spend, used: { amount_minor, currency: 'USD', exponent: 2 } },
+  }) });
+  // The amount, not a bang: the operator asked what this account has cost.
+  assert.equal(spendTag(spent(1)), '$0.01');
+  assert.equal(spendTag(spent(1435)), '$14.35');
   // Spent-then-disabled is history, not a cost of routing here now.
   assert.equal(spendTag({ spend: normalizeSpend(OUT_OF_CREDITS) }), '');
   assert.equal(spendTag({ spend: null }), '');
   assert.equal(spendTag({}), '');
 });
 
+test('spendTag shows the money cap beside the amount when one is set', () => {
+  const spent = (amount_minor) => ({ spend: normalizeSpend({
+    ...BILLABLE, spend: { ...BILLABLE.spend, used: { amount_minor, currency: 'USD', exponent: 2 } },
+  }) });
+  assert.equal(spendTag(spent(1435), 20), '$14.35/20');
+  assert.equal(spendTag(spent(1435), 12.5), '$14.35/12.5');
+  assert.equal(spendTag({ spend: normalizeSpend(BILLABLE) }, 20), '$/20');
+  // An invalid cap is no cap, on the row as in the router.
+  assert.equal(spendTag(spent(1435), -1), '$14.35');
+  assert.equal(spendTag(spent(1435), null), '$14.35');
+  // The row budget takes the tag's width from this same call (see the width
+  // test below), so a wider amount is a wider column, never an overflowing row.
+});
+
+test('the status screen draws the money cap beside the figure it is judged against', () => {
+  const acct = (spend, maxSpend) => ({ maxSpend, quota: { spend } });
+  const billing = (amount_minor) => normalizeSpend({
+    ...BILLABLE, spend: { ...BILLABLE.spend, used: { amount_minor, currency: 'USD', exponent: 2 } },
+  });
+  assert.match(spendLine(acct(billing(1435), 20), paint), /billing real money — \$14\.35 of \$10,000\.00 used this month, cap \$20\.00/);
+  assert.match(spendLine(acct(billing(0), 20), paint), /can bill real money.*\$0\.00 of \$10,000\.00 used, cap \$20\.00/);
+  // At the cap the line leads with that fact — it is why the account is idle.
+  assert.match(spendLine(acct(billing(2000), 20), paint), /spend cap reached — \$20\.00 of \$10,000\.00 used this month, cap \$20\.00/);
+  assert.doesNotMatch(spendLine(acct(billing(1435), null), paint), /cap/);
+});
+
 // The row is budgeted to the terminal cell. #228 fixed an overflow caused by a
 // column the budget did not know about; the money tag is another such column,
 // so it gets the same treatment and the same guard.
-function renderRows(width, spends) {
+function renderRows(width, spends, caps = []) {
   const am = new AccountManager(spends.map((_, i) => ({
     name: `acct${i}@example.com`, type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000,
+    ...(caps[i] != null ? { maxSpend: caps[i] } : {}),
   })), 0.98);
   const h = 3600_000;
   am.accounts.forEach((a, i) => {
@@ -196,6 +252,17 @@ test('the money tag never pushes an account row past the terminal edge', () => {
     const widest = Math.max(...rows.map(r => r.length));
     assert.ok(widest <= w, `W=${w}: widest row is ${widest} columns`);
     assert.ok(rows.some(r => /\$/.test(r)), `W=${w}: the tag was budgeted but never drawn`);
+  }
+});
+
+test('a four-figure amount with a cap is the widest tag, and still fits the row', () => {
+  const big = normalizeSpend({ ...BILLABLE, spend: { ...BILLABLE.spend, used: { amount_minor: 123456, currency: 'USD', exponent: 2 } } });
+  const spends = [big, normalizeSpend(BILLABLE), null];
+  for (const w of [60, 70, 80, 100, 160]) {
+    const rows = renderRows(w, spends, [2000, 20, null]);
+    const widest = Math.max(...rows.map(r => r.length));
+    assert.ok(widest <= w, `W=${w}: widest row is ${widest} columns`);
+    assert.ok(rows.some(r => r.includes('$1,234.56/2000')), `W=${w}: the capped amount was not drawn in full`);
   }
 });
 

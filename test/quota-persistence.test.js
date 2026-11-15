@@ -16,7 +16,9 @@ test('exportQuotaState carries only persistable fields and identity, no credenti
   // identifies an account that has no Anthropic uuid to be matched by.
   assert.deepEqual(
     Object.keys(entry).sort(),
-    ['accountUuid', 'accountId', 'provider', 'name', 'orgName', 'orgUuid', 'profile', 'quota', 'adaptive'].sort(),
+    // `outsideSpend` is learned state like `adaptive` (#475): per-window sums,
+    // never a token or an activity stamp.
+    ['accountUuid', 'accountId', 'userId', 'provider', 'name', 'orgName', 'orgUuid', 'profile', 'quota', 'adaptive', 'outsideSpend'].sort(),
   );
   assert.equal(entry.accountUuid, 'p1');
   assert.equal(entry.provider, 'anthropic');
@@ -46,7 +48,7 @@ test('adaptive burn and concurrency learning survive an identity-matched restart
 test('quota survives an export → restore round-trip', () => {
   const am1 = new AccountManager([oauth('a', { accountUuid: 'p1', orgUuid: 'o1' })], 0.98);
   const future = Date.now() + 3600_000;
-  Object.assign(am1.accounts[0].quota, { unified5h: 0.3, unified7d: 0.6, unified7dReset: future });
+  Object.assign(am1.accounts[0].quota, { unified5h: 0.3, unified7d: 0.6, unified7dReset: future, sessionWindowStated: true, weeklyWindowStated: false });
 
   const am2 = new AccountManager([oauth('a', { accountUuid: 'p1', orgUuid: 'o1' })], 0.98);
   am2.restoreQuotaState(am1.exportQuotaState());
@@ -54,6 +56,8 @@ test('quota survives an export → restore round-trip', () => {
   assert.equal(am2.accounts[0].quota.unified5h, 0.3);
   assert.equal(am2.accounts[0].quota.unified7d, 0.6);
   assert.equal(am2.accounts[0].quota.unified7dReset, future);
+  assert.equal(am2.accounts[0].quota.sessionWindowStated, true);
+  assert.equal(am2.accounts[0].quota.weeklyWindowStated, false);
   assert.equal(am2.accounts[0].probing, false); // weekly window known → not probing
 });
 
@@ -100,6 +104,32 @@ test('a restored window whose reset already passed is cleared on first use', () 
   assert.equal(am.accounts[0].quota.unified7d, 0.5); // restored...
   am.refreshExpiredQuotas();
   assert.equal(am.accounts[0].quota.unified7d, null); // ...then cleared as stale
+});
+
+test('a limit of 0 in a state file is not restored, nor its remaining; a positive pair is', () => {
+  // Written by a version that stored any limit upstream sent: restored as-is, it
+  // handed 1 - 0/0 = NaN back to every standard-quota reader.
+  const am = new AccountManager([oauth('a', { accountUuid: 'p1' }), oauth('b', { accountUuid: 'p2' }), oauth('c', { accountUuid: 'p3' })], 0.98);
+  const resetsAt = new Date(Date.now() + 3600_000).toISOString();
+  am.restoreQuotaState([
+    { accountUuid: 'p1', quota: { tokensLimit: 0, tokensRemaining: 0, requestsLimit: 0, requestsRemaining: 0, resetsAt } },
+    { accountUuid: 'p2', quota: { tokensLimit: 1000, tokensRemaining: 100, requestsLimit: 50, requestsRemaining: 5, resetsAt } },
+    { accountUuid: 'p3', quota: { tokensRemaining: 7, requestsRemaining: 3, resetsAt } },
+  ]);
+  const [a, b, c] = am.accounts;
+  assert.equal(am._maxUtilization(a), 0);
+  assert.equal(a.quota.tokensLimit, null);
+  assert.equal(a.quota.requestsLimit, null);
+  assert.equal(a.quota.tokensRemaining, null, 'a refused pair is dropped whole');
+  assert.equal(a.quota.requestsRemaining, null, 'a refused pair is dropped whole');
+  assert.equal(a.quota.resetsAt, resetsAt, 'the rest of the entry is restored as before');
+  assert.equal(b.quota.tokensLimit, 1000);
+  assert.equal(b.quota.requestsLimit, 50);
+  assert.equal(b.quota.tokensRemaining, 100);
+  assert.equal(b.quota.requestsRemaining, 5);
+  assert.equal(am._maxUtilization(b), 0.9);
+  assert.equal(c.quota.tokensRemaining, 7, 'a remaining saved without a limit is restored as before');
+  assert.equal(c.quota.requestsRemaining, 3, 'a remaining saved without a limit is restored as before');
 });
 
 test('restoreQuotaState ignores a non-array / missing payload', () => {

@@ -1,0 +1,553 @@
+// Banked Claude usage-limit resets: read the grants, spend a chosen one by
+// hand, or spend one at the pool-dry refusal when the operator has armed
+// `autoRedeemResets` — the same switch, moment and per-account exemption as
+// the Codex reset credits.
+//
+// The Codex counterpart is codex-reset-credits.js. Anthropic's version differs
+// in ways that matter for a call that cannot be undone:
+//
+//  - The grants live in the usage payload's `cedar_ember` block, which is only
+//    filled in for a caller that asks with `?cedar_ember=1` and identifies as
+//    Claude Code; anything else reads `eligible: false, ineligible_reason:
+//    "surface"`, a statement about the caller and not the account.
+//  - Status-only reads add `&skip_spend=1`, as Claude Code does. Manual claims
+//    try a fresh read, but may use a held, unblocked grant from a reading no
+//    more than 15 minutes old if that read fails. Upstream validates the claim;
+//    a successful fresh read that removes or blocks a grant is authoritative.
+//  - Spending names any usable grant; auto-redeem picks the cheapest kind that
+//    clears every exhausted limit, then the soonest expiry and `next_grant_id`.
+//    "Exhausted" is what upstream reports at its own limit, or — for an account
+//    the proxy parked at its weekly switch threshold before upstream's limit
+//    was ever reached (#685) — the limits behind the readings that parked it.
+//    The endpoint is organization-scoped
+//    (POST /api/organizations/<orgUuid>/reset_rate_limits), and the body is
+//    `{ program: "cedar_ember", grant_id, request_id }`.
+//  - The verdict is in the body's `result`: `reset` (spent, windows cleared),
+//    `already_used` (this request id already went through), `not_limited`,
+//    `cooldown`, `ineligible`, `unavailable` (nothing spent). A non-2xx or a
+//    lost connection is no verdict at all, over a POST that may have spent the
+//    grant — so the request id is kept and replayed, and the fleet holds off.
+//
+// Shapes read from Claude Code 2.1.290's own client and confirmed against a
+// live redemption on 2026-10-10 (`result: "reset"`, `cleared: [five_hour,
+// seven_day, seven_day_overage_included]`, `resets_left: 0`).
+
+import { randomUUID } from 'node:crypto';
+
+import { USAGE_URL, OAUTH_USAGE_BETA, USAGE_USER_AGENT, normalizeUsagePayload, isFableReset } from './oauth.js';
+import { providerOf, DEFAULT_PROVIDER } from './provider.js';
+import { safeLine } from './safe-text.js';
+import { rememberResetReading, resetRetryAt } from './reset-readings.js';
+import { proxyFetch } from './upstream-fetch.js';
+
+export const CLAUDE_RESET_PROGRAM = 'cedar_ember';
+const RESET_HOST = 'https://api.anthropic.com';
+const GRANT_ID = /^[a-z0-9_-]{1,40}$/;
+
+// After a spend that worked: long enough that one dry pool costs one reset,
+// short enough that a pool dry again tomorrow is asked again.
+const SUCCESS_HOLD_MS = 60 * 60 * 1000;
+// After a verdict we never read: the grant may be spent, so nothing else is.
+const UNKNOWN_HOLD_MS = 30 * 60 * 1000;
+// After upstream said "nothing to do here" for this account.
+const DECLINED_COOLDOWN_MS = 30 * 60 * 1000;
+// After an account turned out to hold nothing usable.
+const NOTHING_COOLDOWN_MS = 6 * 60 * 60 * 1000;
+export const CLAUDE_REDEEM_BUDGET_MS = 15_000;
+
+// The upstream limit behind each quota reading, in the names a grant's `clears`
+// uses, where a live redemption has shown it: #677 measured a grant that
+// clears `seven_day_overage_included` taking the Fable weekly from 100% to 0
+// while `seven_day` was not cleared. A reading with no entry here (the Sonnet
+// weekly, a learned scoped bucket) has no established name, so no grant can be
+// shown to clear it and none is spent for it.
+/** @type {Record<string, string>} */
+const LIMIT_FOR_BUCKET = { unified5h: 'five_hour', unified7d: 'seven_day', unified7dFable: 'seven_day_overage_included' };
+
+/** @param {Record<string, any>} account */
+function headers(account) {
+  return {
+    Authorization: `Bearer ${account.credential}`,
+    'anthropic-beta': OAUTH_USAGE_BETA,
+    'User-Agent': USAGE_USER_AGENT,
+    Accept: 'application/json',
+  };
+}
+
+/** @param {unknown} v */
+const isoMs = v => {
+  if (typeof v !== 'string') return null;
+  const t = Date.parse(v);
+  return Number.isFinite(t) ? t : null;
+};
+
+/** @param {unknown} v */
+const names = v => (Array.isArray(v) ? v.filter(x => typeof x === 'string' && x.length <= 64) : []);
+
+/** @param {unknown} value */
+function percentUsed(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  return Object.fromEntries(Object.entries(value).filter(([key, n]) => key.length <= 64 && Number.isInteger(n) && n >= 0 && n <= 100));
+}
+
+/**
+ * @param {{ clears?: unknown, type?: unknown }} grant
+ * @returns {'fable'|'weekly'|'session'}
+ */
+export function claudeGrantKind(grant) {
+  if (isFableReset(grant?.clears)) return 'fable';
+  return grant?.type === 'session' ? 'session' : 'weekly';
+}
+
+/**
+ * The `cedar_ember` block as the redeemer reasons about it, or null when the
+ * payload says nothing usable. Unlike oauth.js's `bankedResets`, this keeps the
+ * grant ids: it exists to spend one.
+ *
+ * @param {any} block
+ */
+export function parseResetStatus(block) {
+  if (!block || typeof block !== 'object' || typeof block.eligible !== 'boolean') return null;
+  const grants = (Array.isArray(block.grants) ? block.grants : []).flatMap((/** @type {any} */ g) => {
+    if (!g || typeof g !== 'object' || typeof g.id !== 'string' || !GRANT_ID.test(g.id)) return [];
+    const left = Number(g.resets_left);
+    return [{
+      id: g.id,
+      label: typeof g.label === 'string' ? safeLine(g.label, 64) : null,
+      resetsLeft: Number.isInteger(left) && left > 0 ? left : 0,
+      resetsTotal: Number.isInteger(g.resets_total) && g.resets_total >= 0 ? g.resets_total : null,
+      clears: names(g.clears),
+      usableNow: g.usable_now === true,
+      paused: g.paused === true,
+      startsAt: isoMs(g.starts_at),
+      endsAt: isoMs(g.ends_at),
+      type: ['session', 'weekly', 'full'].includes(g.type) ? g.type : null,
+      givesBackWeekly: g.gives_back_weekly === true,
+      useRequiresLimit: typeof g.use_requires_limit === 'boolean' ? g.use_requires_limit : null,
+      percentUsed: percentUsed(g.percent_used),
+      blocking: names(g.blocking),
+      unavailableReason: typeof g.unavailable_reason === 'string' ? safeLine(g.unavailable_reason, 32) : null,
+    }];
+  });
+  const next = typeof block.next_grant_id === 'string' && grants.some((/** @type {{ id: string }} */ g) => g.id === block.next_grant_id) ? block.next_grant_id : null;
+  return {
+    eligible: block.eligible,
+    ineligibleReason: typeof block.ineligible_reason === 'string' ? safeLine(block.ineligible_reason, 32) : null,
+    atLimit: block.at_limit === true,
+    exhausted: names(block.exhausted),
+    nextGrantId: next,
+    cooldownUntil: isoMs(block.cooldown_until),
+    weeklyResetsAt: isoMs(block.weekly_resets_at),
+    grants,
+  };
+}
+
+/** @typedef {NonNullable<ReturnType<typeof parseResetStatus>>} ResetStatus */
+/** @typedef {ResetStatus['grants'][number]} ResetGrant */
+
+/**
+ * @param {ResetGrant} grant
+ * @param {number} now
+ */
+function usableGrant(grant, now) {
+  return grant.resetsLeft >= 1 && grant.usableNow && !grant.paused
+    && (grant.endsAt == null || grant.endsAt > now);
+}
+
+/**
+ * The cheapest usable grant that clears every exhausted limit. Keep broader
+ * resets for walls that need them; within a kind, spend the soonest expiry
+ * (no expiry last), then prefer upstream's `next_grant_id`.
+ *
+ * @param {ResetStatus|null} status
+ * @param {number} [now]
+ */
+export function chooseAutoGrant(status, now = Date.now()) {
+  if (!status?.eligible) return null;
+  const cost = { fable: 0, session: 1, weekly: 2 };
+  return status.grants
+    .filter((/** @type {ResetGrant} */ grant) => usableGrant(grant, now) && status.exhausted.every((/** @type {string} */ limit) => grant.clears.includes(limit)))
+    .sort((/** @type {ResetGrant} */ a, /** @type {ResetGrant} */ b) => cost[claudeGrantKind(a)] - cost[claudeGrantKind(b)]
+      || (a.endsAt ?? Infinity) - (b.endsAt ?? Infinity)
+      || Number(b.id === status.nextGrantId) - Number(a.id === status.nextGrantId))[0] ?? null;
+}
+
+/**
+ * Read one account's reset status and quota, without spend. Claude Code uses
+ * `skip_spend=1` for these reads. Its payload may omit any spend/extra-usage
+ * fields, so never apply its spend portion, even when it returns a partial one.
+ * The full quota probe remains the authority on paid-overage readings.
+ *
+ * @param {Record<string, any>} account
+ * @param {{ fetchImpl?: Function, timeoutMs?: number }} [opts]
+ */
+export async function fetchClaudeResetStatus(account, { fetchImpl = proxyFetch, timeoutMs = 10_000 } = {}) {
+  if (!account?.credential) return { error: 'no credential' };
+  try {
+    const res = await fetchImpl(`${USAGE_URL}&skip_spend=1`, { headers: headers(account), signal: AbortSignal.timeout(timeoutMs), routing: account.routing ?? null });
+    if (!res.ok) return { error: `HTTP ${res.status}`, status: res.status, retryAt: resetRetryAt(res) };
+    const data = await res.json();
+    return { reset: parseResetStatus(data?.cedar_ember), usage: { ...normalizeUsagePayload(data), spend: null } };
+  } catch (/** @type {any} */ err) {
+    return { error: safeLine(err?.message || String(err), 120), status: null };
+  }
+}
+
+/**
+ * Spend one grant. The single irreversible call in this file. `requestId` must
+ * be replayed after an unread answer, never re-minted.
+ *
+ * @param {Record<string, any>} account
+ * @param {{ grantId: string, requestId: string }} claim
+ * @param {{ fetchImpl?: Function, timeoutMs?: number }} [opts]
+ */
+export async function claimClaudeReset(account, { grantId, requestId }, { fetchImpl = proxyFetch, timeoutMs = 20_000 } = {}) {
+  if (!account?.credential || !account?.orgUuid) return { error: 'missing Claude account identity' };
+  if (!GRANT_ID.test(grantId) || !/^[A-Za-z0-9_-]{1,64}$/.test(requestId)) return { error: 'malformed grant or request id' };
+  try {
+    const res = await fetchImpl(`${RESET_HOST}/api/organizations/${encodeURIComponent(account.orgUuid)}/reset_rate_limits`, {
+      method: 'POST',
+      headers: { ...headers(account), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ program: CLAUDE_RESET_PROGRAM, grant_id: grantId, request_id: requestId }),
+      signal: AbortSignal.timeout(timeoutMs),
+      routing: account.routing ?? null,
+    });
+    if (!res.ok) return { error: `HTTP ${res.status}`, status: res.status };
+    const data = await res.json();
+    const result = typeof data?.result === 'string' ? safeLine(data.result, 32) : null;
+    const left = Number(data?.resets_left);
+    return {
+      result,
+      reason: typeof data?.reason === 'string' ? safeLine(data.reason, 32) : null,
+      resetsLeft: Number.isInteger(left) ? left : null,
+      cleared: names(data?.cleared),
+      cooldownUntil: isoMs(data?.cooldown_until),
+      weeklyResetsAt: isoMs(data?.weekly_resets_at),
+    };
+  } catch (/** @type {any} */ err) {
+    return { error: safeLine(err?.message || String(err), 120), status: null };
+  }
+}
+
+/**
+ * When this account would come back on its own: the latest reset among the
+ * windows it has spent. The pool-dry walk spends on the account that would wait
+ * longest, since a reset there buys the most.
+ *
+ * @param {Record<string, any>} account
+ * @param {number} now
+ */
+export function blockedUntil(account, now = Date.now()) {
+  const q = account?.quota || {};
+  let until = 0;
+  for (const [use, reset] of [['unified5h', 'unified5hReset'], ['unified7d', 'unified7dReset'], ['unified7dFable', 'unified7dFableReset'], ['unified7dSonnet', 'unified7dSonnetReset']]) {
+    if (q[use] != null && q[use] >= 0.98 && q[reset] > now) until = Math.max(until, q[reset]);
+  }
+  return until;
+}
+
+/** @typedef {{ redeemed: boolean, reason: string, uncertain?: boolean, account?: string, result?: string|null, resetsLeft?: number|null, cleared?: string[] }} ClaudeRedeemResult */
+
+export class ClaudeResetRedeemer {
+  /**
+   * @param {any} accountManager
+   * @param {{ config?: Record<string, any>|null, statusFn?: Function, claimFn?: Function, now?: () => number, log?: Function, timeoutMs?: number }} [opts]
+   */
+  constructor(accountManager, { config = null, statusFn = fetchClaudeResetStatus, claimFn = claimClaudeReset, now = Date.now, log = console.log, timeoutMs = CLAUDE_REDEEM_BUDGET_MS } = {}) {
+    this.am = accountManager;
+    this.config = config;
+    this.statusFn = statusFn;
+    this.claimFn = claimFn;
+    this.now = now;
+    this.log = log;
+    this.timeoutMs = timeoutMs;
+    /** @type {WeakMap<object, { cooldownUntil: number, requestIds: Map<string, string> }>} */
+    this.state = new WeakMap();
+    /** @type {Promise<ClaudeRedeemResult>|null} */
+    this.inFlight = null;
+    // reset-actions holds this across the fresh read and the manual claim.
+    this.manualInFlight = false;
+    /** @type {number|null} */
+    this.fleetHoldStartedAt = null;
+  }
+
+  /**
+   * The fleet hold: armed by a reset that landed or may have, it stops the next
+   * refusal — and the rest of this one's walk — spending a sibling's reset on
+   * top of it. Kept on the accounts' saved quota (`claudeResetHoldUntil`), so a
+   * restart minutes after a claim that may have landed does not spend another;
+   * the latest any account carries holds them all.
+   */
+  get fleetHoldUntil() {
+    let until = 0;
+    for (const account of this.am.accounts || []) {
+      const held = account.quota?.claudeResetHoldUntil;
+      if (Number.isFinite(held)) until = Math.max(until, held);
+    }
+    return until;
+  }
+
+  /**
+   * @param {Record<string, any>} account
+   * @param {number} until
+   */
+  _holdFleet(account, until) {
+    account.quota ??= {};
+    const held = account.quota.claudeResetHoldUntil;
+    if (!Number.isFinite(held) || until >= held) this.fleetHoldStartedAt = this.now();
+    account.quota.claudeResetHoldUntil = Number.isFinite(held) ? Math.max(held, until) : until;
+  }
+
+  /** Every status read, including auto-redeem and post-claim quota reapply.
+   * @param {Record<string, any>} account
+   * @param {{ timeoutMs?: number }} [opts]
+   */
+  async readStatus(account, opts = {}) {
+    let read;
+    try { read = await this.statusFn(account, opts); } catch (/** @type {any} */ error) {
+      read = { error: error?.message || String(error) };
+    }
+    rememberResetReading(account, 'claude', read, this.now());
+    return read;
+  }
+
+  /** @param {object} account */
+  _stateFor(account) {
+    let s = this.state.get(account);
+    if (!s) { s = { cooldownUntil: 0, requestIds: new Map() }; this.state.set(account, s); }
+    return s;
+  }
+
+  /** @param {Record<string, any>} account */
+  _isClaude(account) {
+    return !!account && providerOf(account) === DEFAULT_PROVIDER && !account.upstream && account.type === 'oauth';
+  }
+
+  /**
+   * The pool-dry entry point: every Claude account this request could use is
+   * out, so maybe spend ONE reset on one of `accounts`. Armed by the same fleet
+   * switch as the Codex redeemer (`autoRedeemResets`), read off the shared
+   * config per refusal so a toggle applies at once.
+   *
+   * `model` is the refused request's: it decides which weekly bucket governs,
+   * and so whether the switch threshold is what parked an account.
+   *
+   * @param {Record<string, any>[]} accounts
+   * @param {{ model?: string|null }} [opts]
+   * @returns {Promise<ClaudeRedeemResult>}
+   */
+  async maybeRedeemForPool(accounts, { model = null } = {}) {
+    if (this.config?.autoRedeemResets !== true) return { redeemed: false, reason: 'auto-redeem is switched off' };
+    if (!accounts?.length) return { redeemed: false, reason: 'no candidate accounts' };
+    if (this.manualInFlight) return { redeemed: false, reason: 'a manual reset is in progress' };
+    if (this.inFlight) return this.inFlight;
+    const attempt = this._attempt(accounts, model).finally(() => { this.inFlight = null; });
+    this.inFlight = attempt;
+    return attempt;
+  }
+
+  /**
+   * @param {Record<string, any>[]} accounts
+   * @param {string|null} model
+   */
+  async _attempt(accounts, model) {
+    const now = this.now();
+    if (now < this.fleetHoldUntil) return { redeemed: false, reason: 'holding off after a recent Claude reset attempt' };
+    const deadline = now + this.timeoutMs;
+    const candidates = accounts
+      // Not a cordoned account: a reset there would buy new work it takes none of.
+      .filter(a => this._isClaude(a) && a.orgUuid && !a.disabled && !a.cordoned && a.autoRedeemReset !== false)
+      .filter(a => a.quota?.resetCredits?.available !== 0)
+      .filter(a => now >= this._stateFor(a).cooldownUntil)
+      .sort((a, b) => blockedUntil(b, now) - blockedUntil(a, now));
+    let reason = 'no Claude account holds a usable reset';
+    for (const account of candidates) {
+      if (this.now() >= deadline) { reason = 'ran out of the redeem budget'; break; }
+      const r = await this._redeem(account, deadline, model);
+      if (r.redeemed) return r;
+      reason = r.reason;
+      if (this.now() < this.fleetHoldUntil) break;
+    }
+    return { redeemed: false, reason };
+  }
+
+  /**
+   * Pass over an account that holds a usable reset, and say so. The cooldown
+   * set here is also what rate-limits the line: the walk skips the account
+   * until it ends, so a dry pool being polled logs one line per account per
+   * cooldown, not one per refusal.
+   *
+   * @param {Record<string, any>} account
+   * @param {number} until  when this account may be asked again
+   * @param {string} reason
+   * @returns {ClaudeRedeemResult}
+   */
+  _decline(account, until, reason) {
+    const name = safeLine(account.name, 64);
+    this._stateFor(account).cooldownUntil = until;
+    this.log(`[TeamClaude] Account "${name}": banked reset not redeemed: ${safeLine(reason, 160)}`);
+    return { redeemed: false, account: name, reason };
+  }
+
+  /**
+   * The upstream limits a reset must clear on an account the proxy itself holds
+   * out of rotation at its weekly switch threshold, though upstream does not
+   * report it at a limit. The manager decides whether it is parked and by which
+   * readings, with the thresholds that apply to this account and model. Null
+   * when it is not parked on a weekly reading (below its threshold, parked by
+   * the 5-hour window alone, or barred for another reason); `unknown` names a
+   * parking reading no grant can be shown to clear.
+   *
+   * @param {Record<string, any>} account
+   * @param {string|null} model
+   * @returns {{ limits: string[], unknown: string|null }|null}
+   */
+  _parkedLimits(account, model) {
+    /** @type {string[]|null|undefined} */
+    const buckets = this.am.weeklyParkedBuckets?.(account, model);
+    if (!buckets?.length) return null;
+    return {
+      limits: buckets.flatMap(b => LIMIT_FOR_BUCKET[b] ?? []),
+      unknown: buckets.find(b => !LIMIT_FOR_BUCKET[b]) ?? null,
+    };
+  }
+
+  /**
+   * @param {Record<string, any>} account
+   * @param {number} deadline
+   * @param {string|null} [model]
+   * @returns {Promise<ClaudeRedeemResult>}
+   */
+  async _redeem(account, deadline, model = null) {
+    const name = safeLine(account.name, 64);
+    const state = this._stateFor(account);
+    const now = this.now();
+    try { await this.am.ensureTokenFresh(account.index); } catch (/** @type {any} */ err) {
+      return { redeemed: false, account: name, reason: `token refresh failed (${safeLine(err?.message || String(err), 80)})` };
+    }
+    const left = () => Math.max(1, deadline - this.now());
+    const read = await this.readStatus(account, { timeoutMs: left() });
+    if (read?.error) {
+      state.cooldownUntil = now + DECLINED_COOLDOWN_MS;
+      return { redeemed: false, account: name, reason: `could not read reset status (${read.error})` };
+    }
+    const status = read.reset;
+    if (!status || !status.eligible) {
+      state.cooldownUntil = now + NOTHING_COOLDOWN_MS;
+      return { redeemed: false, account: name, reason: `not eligible for resets${status?.ineligibleReason ? ` (${status.ineligibleReason})` : ''}` };
+    }
+    if (!status.grants.some((/** @type {ResetGrant} */ g) => usableGrant(g, now))) {
+      state.cooldownUntil = now + NOTHING_COOLDOWN_MS;
+      return { redeemed: false, account: name, reason: 'holds no usable reset' };
+    }
+    // What a grant has to clear, and the grants that may be spent on it.
+    /** @type {ResetStatus} */
+    let wall = status;
+    if (!status.atLimit || !status.exhausted.length) {
+      // Upstream reports no wall. Selection stops using an account at its
+      // switch threshold, so a busy fleet never reaches one: every account
+      // parks a little short, and the pool is dry with resets banked (#685).
+      // Upstream accepts a claim there, so an account parked by a WEEKLY
+      // threshold counts as walled by the limits behind that reading. The
+      // status read carries the account's quota as of now, so the manager
+      // judges on that and not on a reading that may have gone stale.
+      if (read.usage && !read.usage.error) this.am.applyUsageData?.(account.index, read.usage);
+      const parked = this._parkedLimits(account, model);
+      if (!parked) return this._decline(account, now + DECLINED_COOLDOWN_MS, 'not at a usage limit, nor held out of rotation by its weekly switch threshold');
+      if (parked.unknown) return this._decline(account, now + DECLINED_COOLDOWN_MS, `no reset is known to clear its ${parked.unknown} reading`);
+      // A grant that says it needs the limit reached would answer `not_limited`.
+      const grants = status.grants.filter((/** @type {ResetGrant} */ g) => g.useRequiresLimit !== true);
+      if (!grants.some((/** @type {ResetGrant} */ g) => usableGrant(g, now))) {
+        return this._decline(account, now + DECLINED_COOLDOWN_MS, 'its reset can only be used at the upstream limit');
+      }
+      wall = { ...status, grants, exhausted: [...new Set([...parked.limits, ...status.exhausted])] };
+    } else if (!status.exhausted.some((/** @type {string} */ limit) => limit.startsWith('seven_day'))) {
+      // A grant is scarce and a 5-hour wall lifts on its own within hours: spend
+      // one only where a weekly limit (the all-models week or a family's,
+      // `seven_day*`) is what turns the account away.
+      return this._decline(account, now + DECLINED_COOLDOWN_MS, 'no weekly limit is exhausted');
+    }
+    // Spent on an account it would not return to service, a reset buys this
+    // request nothing — and the grant is gone.
+    const grant = chooseAutoGrant(wall, now);
+    if (!grant) {
+      // No usable grant covers the whole wall. Name the limits none clears,
+      // or the whole wall when separate grants only cover parts of it.
+      const uncovered = wall.exhausted.filter((/** @type {string} */ limit) => !wall.grants.some((/** @type {ResetGrant} */ g) => usableGrant(g, now) && g.clears.includes(limit)));
+      return this._decline(account, now + DECLINED_COOLDOWN_MS, `its reset does not clear ${(uncovered.length ? uncovered : wall.exhausted).join(', ')}`);
+    }
+    // Upstream already says a claim now would answer `cooldown`: save the POST.
+    if (status.cooldownUntil != null && status.cooldownUntil > now) {
+      return this._decline(account, status.cooldownUntil, 'upstream reports a reset cooldown');
+    }
+    return this.redeemGrant(account, grant.id, { deadline, kind: claudeGrantKind(grant) });
+  }
+
+  /**
+   * Shared claim execution. Manual callers validate fresh details, or recent
+   * cached details if the fresh Claude read failed, in reset-actions first;
+   * auto callers keep all policy checks in _redeem.
+   * Unread claims keep a separate replay key for each chosen grant.
+   *
+   * @param {Record<string, any>} account
+   * @param {string} grantId
+   * @param {{ manual?: boolean, deadline?: number, kind?: ReturnType<typeof claudeGrantKind> }} [opts]
+   * @returns {Promise<ClaudeRedeemResult>}
+   */
+  async redeemGrant(account, grantId, { manual = false, deadline = this.now() + this.timeoutMs, kind } = {}) {
+    if (manual && this.inFlight) return { redeemed: false, reason: 'an automatic reset is in progress' };
+    const name = safeLine(account.name, 64);
+    const state = this._stateFor(account);
+    const now = this.now();
+    const requestId = state.requestIds.get(grantId) || randomUUID();
+    state.requestIds.set(grantId, requestId);
+    const action = manual ? 'Manual Claude reset' : 'Claude reset';
+    this.log(manual
+      ? `[TeamClaude] Manually redeeming a banked Claude reset on "${name}"`
+      : `[TeamClaude] Redeeming a banked Claude ${kind === 'fable' ? 'Fable' : kind ?? 'usage-limit'} reset on "${name}" — no Claude account can serve the request`);
+    let r;
+    try {
+      r = await this.claimFn(account, { grantId, requestId }, { timeoutMs: Math.max(1, deadline - this.now()) });
+    } catch (/** @type {any} */ err) {
+      r = { error: safeLine(err?.message || String(err), 120) };
+    }
+
+    if (r?.error) {
+      // No verdict, over a POST that may have spent the grant: keep the key for
+      // a replay, and stop anything else spending in the meantime.
+      state.cooldownUntil = now + UNKNOWN_HOLD_MS;
+      this._holdFleet(account, now + UNKNOWN_HOLD_MS);
+      this.log(`[TeamClaude] ${action} on "${name}" got no verdict (${r.error}); it may have been spent, so the fleet holds off`);
+      return { redeemed: false, uncertain: true, account: name, reason: `reset request failed (${r.error}); it may still have gone through` };
+    }
+    state.requestIds.delete(grantId);
+    if (r?.result === 'reset' || r?.result === 'already_used') {
+      state.cooldownUntil = now + SUCCESS_HOLD_MS;
+      this._holdFleet(account, now + SUCCESS_HOLD_MS);
+      this.log(`[TeamClaude] ${manual ? 'Manually redeemed' : 'Redeemed'} a Claude usage-limit reset on "${name}" — cleared ${(r.cleared || []).join(', ') || 'its limits'}, ${r.resetsLeft ?? '?'} left`);
+      try { await this._reapply(account, deadline); } catch {
+        this.log(`[TeamClaude] Could not re-read Claude quota for "${name}" after the reset — it will be re-learned from traffic`);
+      }
+      return { redeemed: true, account: name, reason: manual ? 'manual redeem' : 'no Claude account could serve the request', result: r.result, resetsLeft: r.resetsLeft, cleared: r.cleared };
+    }
+    state.cooldownUntil = r?.result === 'cooldown' && r.cooldownUntil ? r.cooldownUntil : now + DECLINED_COOLDOWN_MS;
+    this.log(`[TeamClaude] ${action} on "${name}" declined upstream (${r?.result || 'no result'}${r?.reason ? `: ${r.reason}` : ''}); nothing was spent`);
+    return { redeemed: false, account: name, reason: `upstream declined (${r?.result || 'no result'}${r?.reason ? `: ${r.reason}` : ''})`, result: r?.result };
+  }
+
+  /**
+   * Put the account back in service: drop any hold and any stored upstream
+   * `rejected` verdict (a quota re-read does not touch it, so the account would
+   * otherwise read `upstream-rejected` until it went stale), then re-read its
+   * quota. Never fabricates a reading; if the read fails, traffic re-learns it.
+   *
+   * @param {Record<string, any>} account
+   * @param {number} deadline
+   */
+  async _reapply(account, deadline) {
+    try { this.am.clearRateLimited(account.index); } catch { /* not held */ }
+    try { this.am.clearUpstreamRejected(account.index); } catch { /* not rejected */ }
+    const read = await this.readStatus(account, { timeoutMs: Math.max(1, deadline - this.now()) });
+    if (read?.usage && !read.usage.error) this.am.applyUsageData(account.index, read.usage);
+  }
+}

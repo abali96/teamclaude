@@ -1,12 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import net from 'node:net';
 import http from 'node:http';
-import { spawn } from 'node:child_process';
-import { mkdtemp, writeFile, readFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { randomUUID } from 'node:crypto';
+import { writeFile, readFile } from 'node:fs/promises';
+import { spawnServer } from '../test-helpers/spawn-server.js';
 
 // Live reload (POST /teamclaude/reload → reloadAccounts) must hot-apply
 // `eventLogging` and `blockedModels`. server.js reads both per request off the
@@ -16,68 +13,28 @@ import { fileURLToPath } from 'node:url';
 // drive the real server as a subprocess against a throwaway TEAMCLAUDE_CONFIG;
 // the stub upstream's hit list is the witness for both gates.
 
-const cliPath = fileURLToPath(new URL('../src/index.js', import.meta.url));
-
 const EVENT_LOG = '/api/event_logging/v2/batch';
 
 function listen(server) {
   return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
 }
 
-// A port nothing is listening on: bind one, learn its number, give it back.
-function closedPort() {
-  return new Promise(resolve => {
-    const probe = net.createServer();
-    probe.listen(0, '127.0.0.1', () => {
-      const { port } = probe.address();
-      probe.close(() => resolve(port));
-    });
-  });
-}
+// Every request this file sends carries the marker, and the proxy relays it
+// with the rest of the client's headers. The stub counts only those: its port
+// is an ephemeral one that another test file's "dead upstream" may have held a
+// moment ago, and a request from that file's proxy is not one of the two gates
+// letting something through (seen on CI as 2 hits where 0 were sent).
+const MARKER = 'x-reload-test-run';
+const RUN = randomUUID();
 
-function startServer(configPath) {
-  const child = spawn(process.execPath, [cliPath, 'server', '--headless'], {
-    env: { ...process.env, TEAMCLAUDE_CONFIG: configPath, TEAMCLAUDE_DISABLE_AUTOUPDATE: '1' },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  let output = '';
-  child.stdout.setEncoding('utf8');
-  child.stderr.setEncoding('utf8');
-  child.stdout.on('data', c => { output += c; });
-  child.stderr.on('data', c => { output += c; });
-  const stop = async () => {
-    child.kill('SIGTERM');
-    const killer = setTimeout(() => child.kill('SIGKILL'), 5000);
-    // Node does not replay 'exit' to late listeners: a child that died before
-    // stop() ran (startup port race, mid-test crash) must not hang the await.
-    // No await between the check and the attach, so there is no race window.
-    if (child.exitCode === null && child.signalCode === null) {
-      await new Promise(resolve => child.on('exit', resolve));
-    }
-    clearTimeout(killer);
-  };
-  return { child, stop, output: () => output };
-}
-
-async function waitForServer(port, childOutput) {
-  const deadline = Date.now() + 10_000;
-  for (;;) {
-    try {
-      const res = await fetch(`http://127.0.0.1:${port}/teamclaude/status`);
-      if (res.ok) return;
-    } catch { /* not up yet */ }
-    if (Date.now() > deadline) throw new Error(`server did not start:\n${childOutput()}`);
-    await new Promise(r => setTimeout(r, 100));
-  }
-}
-
-// A recording stand-in for the upstream API: every request it sees is a hit.
+// A recording stand-in for the upstream API: every request of this run that it
+// sees is a hit.
 function startStubUpstream(hits) {
   return http.createServer((req, res) => {
     const chunks = [];
     req.on('data', c => chunks.push(c));
     req.on('end', () => {
-      hits.push({ url: req.url, body: Buffer.concat(chunks).toString('utf8') });
+      if (req.headers[MARKER] === RUN) hits.push({ url: req.url, body: Buffer.concat(chunks).toString('utf8') });
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ id: 'msg_1', type: 'message', role: 'assistant', content: [], usage: { input_tokens: 1, output_tokens: 1 } }));
     });
@@ -90,22 +47,19 @@ async function withServer(fn) {
   const hits = [];
   const stub = startStubUpstream(hits);
   const stubPort = await listen(stub);
-  const proxyPort = await closedPort();
 
-  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-reload-gates-'));
-  const configPath = join(dir, 'config.json');
-  await writeFile(configPath, JSON.stringify({
-    proxy: { port: proxyPort, apiKey: 'tc-test' },
-    upstream: `http://127.0.0.1:${stubPort}`,
-    upstreamProxy: false,
-    eventLogging: 'hide',
-    blockedModels: [],
-    accounts: [{ name: 'a@example.com', type: 'apikey', apiKey: 'k1' }],
-  }));
-
-  const server = startServer(configPath);
+  const server = await spawnServer({
+    config: () => ({
+      proxy: { apiKey: 'tc-test' },
+      upstream: `http://127.0.0.1:${stubPort}`,
+      upstreamProxy: false,
+      eventLogging: 'hide',
+      blockedModels: [],
+      accounts: [{ name: 'a@example.com', type: 'apikey', apiKey: 'k1' }],
+    }),
+  });
+  const { port: proxyPort, configPath } = server;
   try {
-    await waitForServer(proxyPort, server.output);
     await fn({ hits, proxyPort, configPath });
   } finally {
     await server.stop();
@@ -137,9 +91,8 @@ async function statusOf(proxyPort) {
 async function post(proxyPort, path, body) {
   const res = await fetch(`http://127.0.0.1:${proxyPort}${path}`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', [MARKER]: RUN },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(10_000),
   });
   const text = await res.text();
   return { status: res.status, body: text ? JSON.parse(text) : null };
@@ -200,7 +153,7 @@ test('reload restores the defaults when both keys are removed from disk', async 
     await postEventLog(proxyPort);
     let res = await sendMessage(proxyPort, 'claude-zz-blocked');
     assert.equal(res.status, 400, 'setup: the blocklist is engaged');
-    assert.equal(hits.length, 0, 'setup: both gates answer locally');
+    assert.deepEqual(hits.map(h => h.url), [], 'setup: both gates answer locally');
 
     // A hand-trimmed config has neither key; the running server must fall back
     // to the defaults (hide, nothing blocked) rather than keep the old values.

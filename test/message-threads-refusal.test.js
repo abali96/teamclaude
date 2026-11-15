@@ -43,13 +43,22 @@ test('a continue bound for Anthropic is forwarded', () => {
   assert.equal(refusesThreadContinue(body, anthropic, MESSAGES_URL), false);
 });
 
-// The scope is the per-account binding, not the effective upstream: a fleet
-// sent to a third party through the global `upstream` is documented as not
-// covered. Pinned so switching the predicate to upstreamFor() is a deliberate
-// change with a release note, not a quiet one.
-test('an account without its own upstream is forwarded whatever the fleet points at', () => {
+// The effective upstream decides, not the per-account binding: a fleet sent
+// to a third party through the global `upstream` has the same problem (#379).
+// The default global upstream is Anthropic's own host, so an ordinary fleet is
+// untouched, and the top-level `messageThreads` declares a global relay that
+// does keep thread state, as the per-account flag does for one account.
+test('an account on a third-party global upstream is refused, unless the fleet declares threads', () => {
   const body = withThread({ type: 'continue', previous_message_id: 'msg_1' });
-  assert.equal(refusesThreadContinue(body, { type: 'apikey', apiKey: 'k' }, MESSAGES_URL), false);
+  const onFleet = { type: 'apikey', apiKey: 'k' };
+  assert.equal(refusesThreadContinue(body, onFleet, MESSAGES_URL), false, 'no global upstream given: Anthropic');
+  assert.equal(refusesThreadContinue(body, onFleet, MESSAGES_URL, 'https://api.anthropic.com'), false);
+  assert.equal(refusesThreadContinue(body, onFleet, MESSAGES_URL, 'https://zen.example'), true);
+  assert.equal(refusesThreadContinue(body, onFleet, MESSAGES_URL, 'https://zen.example', true), false, 'the fleet-wide flag');
+  // The fleet-wide flag says nothing about an account with an upstream of its own.
+  assert.equal(refusesThreadContinue(body, thirdParty, MESSAGES_URL, 'https://zen.example', true), true);
+  // And the per-account flag still exempts its account on the global upstream.
+  assert.equal(refusesThreadContinue(body, { ...onFleet, messageThreads: true }, MESSAGES_URL, 'https://zen.example'), false);
 });
 
 // A Responses API body has no Anthropic thread semantics to repair.
@@ -192,15 +201,24 @@ async function listen(handler) {
 
 const SESSION = 'session-under-test';
 
-async function post(accounts, body, pickUpstream) {
+// The stub stands in for Anthropic as the fleet's global upstream, so it is
+// declared to keep thread state (the top-level `messageThreads`): its host is
+// not Anthropic's own, and without the declaration the fleet-wide repair (#379)
+// would refuse the very continues these tests forward. `fleetKeepsThreads`
+// turns that off for the tests of the repair itself.
+async function post(accounts, body, pickUpstream, { fleetKeepsThreads = true } = {}) {
   const seen = [];
-  const { server: upstream, port } = await listen((req, res) => {
+  const received = [];
+  const { server: upstream, port } = await listen(async (req, res) => {
     seen.push(req.url);
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    received.push(Buffer.concat(chunks).toString('utf8'));
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end('{"ok":true}');
   });
   const am = new AccountManager(accounts.map(a => pickUpstream(a, port)), 0.98);
-  const listener = createProxyRequestListener({ accountManager: am, upstream: `http://127.0.0.1:${port}` });
+  const listener = createProxyRequestListener({ accountManager: am, upstream: `http://127.0.0.1:${port}`, config: { messageThreads: fleetKeepsThreads } });
   const { server: proxy, port: proxyPort } = await listen(listener);
   try {
     const res = await fetch(`http://127.0.0.1:${proxyPort}${MESSAGES_URL}`, {
@@ -211,7 +229,7 @@ async function post(accounts, body, pickUpstream) {
     const text = await res.text();
     return {
       status: res.status, text, headers: res.headers,
-      reachedUpstream: seen.length,
+      reachedUpstream: seen.length, received,
       starved: am.sessionTracker.sessions.get(SESSION)?.starved ?? 0,
     };
   } finally {
@@ -281,4 +299,41 @@ test('an Anthropic continue is forwarded untouched', async () => {
   );
   assert.equal(status, 200);
   assert.equal(reachedUpstream, 1);
+});
+
+// Untouched has to hold for the delta that follows a tool call, which is most
+// of them: it opens with the tool_result, and the tool_use that grounds it is
+// in the thread. The tool-pair repair read that as an orphan, and what reached
+// Anthropic was the system turn alone (see tool-pair-sanitize.js).
+test('an Anthropic continue after a tool call reaches the upstream as sent', async () => {
+  const delta = JSON.stringify({
+    model: 'k3',
+    thread: { type: 'continue', previous_message_id: 'msg_1' },
+    messages: [
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'done' }] },
+      { role: 'system', content: [{ type: 'text', text: 'a mid-conversation reminder' }] },
+    ],
+  });
+  const { status, received } = await post([{ name: 'anthropic', type: 'apikey', apiKey: 'k' }], delta, (a) => a);
+  assert.equal(status, 200);
+  assert.deepEqual(received, [delta]);
+});
+
+// The fleet case end to end (#379): the same account on a global upstream that
+// is neither Anthropic's host nor declared to keep threads is refused, and the
+// operator line points at the top-level flag rather than the account's.
+test('a fleet on a third-party global upstream gets the repair, and is told which flag arms it off', async () => {
+  const lines = [];
+  const realError = console.error;
+  console.error = (...args) => { lines.push(args.join(' ')); };
+  let out;
+  try {
+    out = await post([{ name: 'fleet', type: 'apikey', apiKey: 'k' }], continueBody, (a) => a, { fleetKeepsThreads: false });
+  } finally {
+    console.error = realError;
+  }
+  assert.equal(out.status, 400);
+  assert.equal(out.reachedUpstream, 0);
+  const line = lines.find(l => l.includes('refusing message-thread continues'));
+  assert.match(line, /at the top level of the config/);
 });

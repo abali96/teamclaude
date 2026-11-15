@@ -3,20 +3,35 @@
     "port": 3456,
     "apiKey": "tc-change-me-to-a-secret",
     "clientKeys": [
-      { "name": "alice", "key": "tc-alice-own-secret" },
-      { "name": "bob", "key": "tc-bob-own-secret" }
+      { "name": "laptop", "key": "tc-laptop-own-secret" },
+      { "name": "build-box", "key": "tc-build-box-own-secret" },
+      { "name": "sandboxed-agent", "key": "tc-sandboxed-agent-own-secret", "scope": "inference" }
     ],
     "usageDimensions": [
       { "name": "project", "header": "x-teamclaude-project" },
       { "name": "ref", "header": "x-teamclaude-ref" }
     ],
-    "sessionDetail": false
+    "sessionDetail": false,
+    "mcp": "off",
+    "drainTimeoutSeconds": 0,
+    "cliproxyApi": "off",
+    "controlPlane": "client",
+    "usageHistory": false
   },
   "upstream": "https://api.anthropic.com",
   "switchThreshold": 0.98,
+  "stripOverageHeaders": false,
+  "synthesizeQuotaHeaders": false,
+  "poolQuotaHeaders": false,
   "distributeSessions": false,
+  "switchOnSessionReset": true,
+  "adaptiveDistribution": {
+    "scoring": "burndown"
+  },
+  "advisorEligibility": "strict",
   "quotaProbeSeconds": 0,
   "autoUpdate": true,
+  "autoRedeemResets": false,
   "expiryRouting": {
     "enabled": false,
     "tolerance": 1.5,
@@ -39,6 +54,13 @@
       "refreshToken": "sk-ant-ort01-your-refresh-token"
     },
     {
+      "name": "waffles@waffle.com",
+      "type": "oauth",
+      "accessToken": "sk-ant-oat01-your-access-token",
+      "refreshToken": "sk-ant-ort01-your-refresh-token",
+      "routing": "socks5h://alice:s3cret@proxy.example.com:1080"
+    },
+    {
       "name": "codex@example.com",
       "type": "oauth",
       "provider": "codex",
@@ -49,7 +71,22 @@
       "type": "apikey",
       "priority": 10,
       "disabled": false,
+      "cordoned": false,
       "apiKey": "sk-ant-api03-your-api-key"
+    },
+    {
+      "name": "api-credit",
+      "type": "apikey",
+      "priority": 100,
+      "disabled": true,
+      "apiKey": "sk-ant-api03-your-credit-org-api-key",
+      "credit": {
+        "amount": 200,
+        "currency": "USD",
+        "cycleStart": "2026-11-02",
+        "adminKey": "sk-ant-admin01-your-admin-key",
+        "refreshMinutes": 15
+      }
     }
   ],
   "routes": [

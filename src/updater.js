@@ -2,6 +2,7 @@
 //
 // We ONLY ever touch a global npm install (`npm install -g @karpeleslab/teamclaude`):
 //   - a git checkout (a `.git` at the package root) is a dev tree — never touched;
+//   - a pnpm install is pointed at pnpm, since npm cannot update it;
 //   - a local dependency / npx copy is left alone (we only notify).
 // Checks hit the npm registry at most once a day (cached in a small file next to
 // the config), so the overwhelmingly common invocation does zero network I/O.
@@ -18,6 +19,7 @@ import { dirname, join, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { getConfigPath } from './config.js';
 import { safeLine } from './safe-text.js';
+import { envVar } from './brand.js';
 
 export const PKG_NAME = '@karpeleslab/teamclaude';
 const REGISTRY = 'https://registry.npmjs.org';
@@ -106,14 +108,29 @@ function npmGlobalRoot() {
   });
 }
 
-/** How this copy was installed: 'git', 'global', 'local', or 'unknown'. */
+/** How this copy was installed: 'git', 'global', 'pnpm', 'local', or 'unknown'. */
 export async function installKind({ root = packageRoot(), globalRoot = npmGlobalRoot } = {}) {
   if (existsSync(join(root, '.git'))) return 'git';
   const norm = root.split('\\').join('/');
   if (!norm.includes('/node_modules/')) return 'unknown';
+  // pnpm links a package out of its `.pnpm` store, and the package root is the
+  // real path, so it runs through that store. Such a copy used to read as
+  // 'local': the notice said "Run: teamclaude update", and that ran `npm
+  // install -g`, which put a second copy in npm's global directory and said
+  // "Updated" while the copy on PATH stayed as it was.
+  if (norm.includes('/node_modules/.pnpm/')) return 'pnpm';
   const g = await (typeof globalRoot === 'function' ? globalRoot() : globalRoot);
   if (g && norm.startsWith(g.split('\\').join('/'))) return 'global';
   return 'local';
+}
+
+/**
+ * The command that updates a copy installed as `kind` in place: pnpm's own for
+ * a pnpm copy, `teamclaude update` (which runs npm) for anything else.
+ * @param {string} kind
+ */
+export function updateCommandFor(kind) {
+  return kind === 'pnpm' ? `pnpm add -g ${PKG_NAME}@latest` : 'teamclaude update';
 }
 
 /** Fetch the registry's current "latest" version (null on any failure/timeout). */
@@ -274,7 +291,7 @@ export async function autoUpdate({
   check = checkForUpdate, kind = installKind, install = runUpdate,
 } = {}) {
   if (existsSync(join(root, '.git'))) return { skipped: 'git' }; // dev checkout — never touch
-  if (process.env.TEAMCLAUDE_DISABLE_AUTOUPDATE || config.autoUpdate === false) {
+  if (envVar('DISABLE_AUTOUPDATE') || config.autoUpdate === false) {
     return { skipped: 'disabled' };
   }
   if (uid === 0) {
@@ -292,8 +309,9 @@ export async function autoUpdate({
     return { ...info, skipped: 'bad-version' };
   }
 
-  if (await kind({ root }) !== 'global') {
-    log(`[TeamClaude] Update available: ${info.current} → ${info.latest}. Run: teamclaude update`);
+  const how = await kind({ root });
+  if (how !== 'global') {
+    log(`[TeamClaude] Update available: ${info.current} → ${info.latest}. Run: ${updateCommandFor(how)}`);
     return { ...info, notified: true };
   }
   log(`[TeamClaude] Updating ${info.current} → ${info.latest}…`);

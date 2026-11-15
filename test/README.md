@@ -33,6 +33,36 @@ that *wants* to go through a mock proxy quietly go direct. That is what
 inherits the shell, so the in-process guard does not reach it. See
 `connect-error-message.test.js`.
 
+## Run the suite through `npm test`
+
+The tests point the CLI and the server at a throwaway config with the legacy
+variable names (`TEAMCLAUDE_CONFIG`, `TEAMCLAUDE_DISABLE_AUTOUPDATE`, ...), and
+`envVar` prefers the renamed spelling whenever it is set. A developer with
+`TEAMROUTER_CONFIG` exported for their own install had the CLI tests write test
+accounts into that real config. `npm test` loads `test-helpers/isolate-env.js`
+first, which drops every `TEAMROUTER_*` variable; running one file directly,
+pass the same flag:
+
+```sh
+node --test --import ./test-helpers/isolate-env.js test/cli-rename.test.js
+```
+
+## Spawn the real server through `test-helpers/spawn-server.js`
+
+A test that runs `src/index.js server --headless` as a child must not pick a
+port itself and poll until "something answers". Files run in parallel, so the
+port a probe just released can be taken before the child's `listen()` — and
+if what took it was another test's in-process `createProxyServer`, its
+`/teamclaude/status` answers 200, the poll is satisfied, and the test drives
+the wrong server (a `POST /teamclaude/reload` there is a 501). `spawnServer()`
+treats a status reply as readiness only when its `server.pid` is the child's
+own, and respawns on a fresh port when the child lost the race. `closedPort()`
+from the same module is still right for a *dead* upstream, where a port nothing
+listens on is the point.
+
+The helper lives outside `test/` because node's default test glob is
+`**/test/**/*.js`: anything under this directory is run as a test file.
+
 ## Clean up in `finally`
 
 A failed assertion must not leave a server listening. A leaked handle keeps the

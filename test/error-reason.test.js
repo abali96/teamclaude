@@ -1,0 +1,123 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { AccountManager } from '../src/account-manager.js';
+import { unavailableLine } from '../src/status-renderer.js';
+import { oauthErrorSummary } from '../src/oauth.js';
+
+// A bare `error` told a status reader nothing it could act on: the reason went
+// to the server log only. Each way into 'error' now leaves its reason on the
+// account, and status carries it while, and only while, the account is in it.
+
+const paint = new Proxy({}, { get: () => (v => String(v)) });
+
+function expiring(over = {}) {
+  return { name: 'a', type: 'oauth', accessToken: 'at-secret-value', refreshToken: 'rt-secret-value', expiresAt: Date.now() - 1000, ...over };
+}
+
+function rejected(status) {
+  const e = /** @type {Error & { status?: number }} */ (new Error(`Token refresh failed (${status}): {"error":"invalid_grant"}`));
+  e.status = status;
+  return e;
+}
+
+test('a rejected refresh token reports its code, status, time and remedy', async () => {
+  const before = Date.now();
+  const am = new AccountManager([expiring()], 0.98, { refreshFn: async () => { throw rejected(400); } });
+  await am.ensureTokenFresh(0);
+  const row = am.getStatus().accounts[0];
+  assert.equal(row.status, 'error');
+  assert.equal(row.errorReason.code, 'refresh_rejected');
+  assert.match(row.errorReason.detail, /\(400\)/);
+  assert.ok(row.errorReason.since >= before);
+  assert.equal(row.errorReason.remedy, 'teamclaude login');
+  assert.doesNotMatch(row.errorReason.detail, /[{}"]/, 'no upstream body in status');
+  assert.doesNotMatch(JSON.stringify(row.errorReason), /secret-value/, 'no token in status');
+});
+
+test('a 401 on a token with nothing to refresh reports credential_rejected', () => {
+  const am = new AccountManager([expiring({ refreshToken: undefined, expiresAt: Date.now() + 3600_000 })], 0.98);
+  am.markCredentialRejected(0, 'upstream rejected its token (401) and it has no refresh token');
+  const row = am.getStatus().accounts[0];
+  assert.equal(row.errorReason.code, 'credential_rejected');
+  assert.equal(row.errorReason.detail, 'upstream rejected its token (401) and it has no refresh token');
+});
+
+test('a Codex account is told to sign in with --codex', () => {
+  const am = new AccountManager([expiring({ provider: 'codex', accountId: 'acct', refreshToken: undefined, expiresAt: Date.now() + 3600_000 })], 0.98);
+  am.markCredentialRejected(0, 'upstream rejected its token (401) and it has no refresh token');
+  assert.equal(am.getStatus().accounts[0].errorReason.remedy, 'teamclaude login --codex');
+});
+
+test('the reason leaves status once the account is back', async () => {
+  const am = new AccountManager([expiring()], 0.98, { refreshFn: async () => { throw rejected(401); } });
+  await am.ensureTokenFresh(0);
+  am.updateAccountTokens(0, { accessToken: 'at2', refreshToken: 'rt2', expiresAt: Date.now() + 3600_000 });
+  const row = am.getStatus().accounts[0];
+  assert.equal(row.status, 'active');
+  assert.equal(row.errorReason, null);
+});
+
+test('a transient refresh failure leaves no reason behind', async () => {
+  const am = new AccountManager([expiring()], 0.98, { refreshFn: async () => { throw rejected(503); } });
+  await am.ensureTokenFresh(0);
+  assert.equal(am.getStatus().accounts[0].errorReason, null);
+});
+
+test('status prints the reason and the command instead of "see logs"', async () => {
+  const am = new AccountManager([expiring()], 0.98, { refreshFn: async () => { throw rejected(400); } });
+  await am.ensureTokenFresh(0);
+  const line = unavailableLine(am.getStatus().accounts[0], paint);
+  assert.match(line ?? '', /needs a re-login: upstream rejected its refresh token \(400\) — run: teamclaude login/);
+  assert.doesNotMatch(line ?? '', /see logs/);
+});
+
+// #629: the endpoint's own reason, and the last refresh that worked, tell an
+// expired token from one revoked or rotated by another client.
+test('the token endpoint reason is kept beside a rejected refresh token, bounded', async () => {
+  assert.equal(oauthErrorSummary('{"error":"invalid_grant","error_description":"Refresh token expired"}'), 'invalid_grant: Refresh token expired');
+  assert.equal(oauthErrorSummary('{"error":"invalid_grant"}'), 'invalid_grant');
+  assert.equal(oauthErrorSummary('not json'), undefined);
+  assert.equal(oauthErrorSummary('{"error":"<script>"}'), undefined, 'only an OAuth error code shape');
+  assert.ok(oauthErrorSummary(`{"error":"invalid_grant","error_description":"${'x'.repeat(500)}"}`).length < 130);
+
+  const err = rejected(400);
+  /** @type {any} */ (err).oauthError = oauthErrorSummary('{"error":"invalid_grant","error_description":"Refresh token expired"}');
+  const am = new AccountManager([expiring()], 0.98, { refreshFn: async () => { throw err; } });
+  await am.ensureTokenFresh(0);
+  const row = am.getStatus().accounts[0];
+  assert.equal(row.errorReason.detail, 'upstream rejected its refresh token (400 invalid_grant: Refresh token expired)');
+  assert.equal(row.lastRefreshAt, null, 'no refresh has worked in this process');
+  assert.doesNotMatch(unavailableLine(row, paint) ?? '', /last good refresh/);
+});
+
+// The same reason nested as an Anthropic API error (oauth.js oauthErrorOf):
+// the code from error.type, the description from error_description, inside or
+// beside it, else the nested message. Bounded and shape-checked the same way.
+test('the token endpoint reason nested as an Anthropic API error is kept too', () => {
+  assert.equal(oauthErrorSummary('{"type":"error","error":{"type":"invalid_grant","message":"Refresh token expired"}}'), 'invalid_grant: Refresh token expired');
+  assert.equal(oauthErrorSummary('{"type":"error","error":{"type":"invalid_grant","error_description":"Refresh token expired","message":"other"}}'), 'invalid_grant: Refresh token expired');
+  assert.equal(oauthErrorSummary('{"type":"error","error":{"type":"invalid_grant"},"error_description":"Refresh token expired"}'), 'invalid_grant: Refresh token expired');
+  assert.equal(oauthErrorSummary('{"type":"error","error":{"type":"invalid_grant","error_description":"inside"},"error_description":"beside"}'), 'invalid_grant: inside', 'inside wins');
+  assert.equal(oauthErrorSummary('{"type":"error","error":{"type":"invalid_grant"}}'), 'invalid_grant');
+  assert.equal(oauthErrorSummary('{"type":"error","error":{"type":"<script>"}}'), undefined, 'only an OAuth error code shape');
+  assert.equal(oauthErrorSummary('{"type":"error","error":{"message":"no type"}}'), undefined);
+  assert.ok(oauthErrorSummary(`{"type":"error","error":{"type":"invalid_grant","message":"${'x'.repeat(500)}"}}`).length < 130);
+});
+
+test('status names the last good refresh beside a rejected refresh token', async () => {
+  let calls = 0;
+  const am = new AccountManager([expiring()], 0.98, {
+    refreshFn: async () => {
+      if (calls++ === 0) return { accessToken: 'at2', refreshToken: 'rt2', expiresAt: Date.now() - 1000 };
+      throw rejected(400);
+    },
+  });
+  await am.ensureTokenFresh(0);
+  const okAt = am.getStatus().accounts[0].lastRefreshAt;
+  assert.ok(Number.isFinite(okAt), 'a working refresh is recorded');
+  await am.ensureTokenFresh(0);
+  const row = am.getStatus().accounts[0];
+  assert.equal(row.status, 'error');
+  assert.equal(row.lastRefreshAt, okAt, 'the rejection does not move it');
+  assert.match(unavailableLine(row, paint) ?? '', /needs a re-login: upstream rejected its refresh token \(400\); last good refresh \S+ ago — run: teamclaude login/);
+});

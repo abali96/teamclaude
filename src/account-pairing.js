@@ -15,6 +15,7 @@
 // credential, and it separates two entries that agree on everything else.
 
 import { sameIdentity, sameOrg } from './identity.js';
+import { setRefreshTokenExpiry } from './refresh-token-expiry.js';
 
 /**
  * The manager account built from config entry `acct`, or null if it has none.
@@ -103,6 +104,51 @@ export function clearRemovedAccountIds(config) {
   if (config?.[REMOVED]) config[REMOVED].clear();
 }
 
+// Entries the operator added in this process, by id — the mirror of REMOVED.
+//
+// A reload now drops a running account no disk row claims (a `teamclaude
+// remove` from another shell). The TUI and the MCP endpoint add an account the
+// other way round: into memory first, then a save. A reload that reads the
+// file in between sees a running account the file does not describe yet and
+// would treat the addition as a removal. An id recorded here names an account
+// whose save has not landed, and the reload leaves it alone.
+//
+// Held on the config object and non-enumerable, like REMOVED, so it never
+// reaches JSON.
+const ADDED = Symbol('addedAccountIds');
+
+/**
+ * Record that `id` was added in memory, so a reload does not drop it before its save lands.
+ * @param {any} config
+ * @param {string|undefined} id
+ */
+export function markAccountAdded(config, id) {
+  if (!config || !id) return;
+  if (!config[ADDED]) {
+    Object.defineProperty(config, ADDED, { value: new Set(), enumerable: false, writable: true });
+  }
+  config[ADDED].add(id);
+}
+
+/**
+ * The ids added so far whose save has not landed.
+ * @param {any} config
+ * @returns {Set<string>}
+ */
+export function addedAccountIds(config) {
+  return config?.[ADDED] || new Set();
+}
+
+/**
+ * Forget the additions, once a save has written a list that carries them. From
+ * then on the rows are on disk, so a reload pairs them like any other and the
+ * ids have nothing left to protect.
+ * @param {any} config
+ */
+export function clearAddedAccountIds(config) {
+  if (config?.[ADDED]) config[ADDED].clear();
+}
+
 /**
  * Which disk row each config entry merges over, as a Map of config index to disk
  * index. A row is claimed by at most one entry.
@@ -174,7 +220,16 @@ export function mergeAccountsForSave(configAccounts, managerAccounts, diskAccoun
       expiresAt: am.expiresAt,
     } : a;
     const diskAcct = diskAccounts[rowFor.get(i)];
-    return diskAcct ? { ...diskAcct, ...live } : live;
+    const row = diskAcct ? { ...diskAcct, ...live } : live;
+    // `endsAt` is the one account field nothing in this process edits: it is
+    // set by `teamclaude ends` or by hand, on disk, and reaches memory at the
+    // next reload. So the row is the authority, in both directions. Without
+    // this a token-refresh save landing between that write and the reload
+    // would put back the end time just cleared, or drop the one just set.
+    if (diskAcct) { if (diskAcct.endsAt != null) row.endsAt = diskAcct.endsAt; else delete row.endsAt; }
+    // The date belongs to the live refresh token: none known for it means none
+    // is saved, whatever the entry or the disk row said about an earlier token.
+    return live === a ? row : setRefreshTokenExpiry(row, am.refreshTokenExpiresAt);
   });
 
   // Carry over rows that exist on disk and not in memory. The list used to be
@@ -216,5 +271,6 @@ export function syncRefreshedTokens(configAccounts, managerAccounts, mgrIdx, new
   configAccounts[i].accessToken = newTokens.accessToken;
   configAccounts[i].refreshToken = newTokens.refreshToken;
   configAccounts[i].expiresAt = newTokens.expiresAt;
+  setRefreshTokenExpiry(configAccounts[i], newTokens.refreshTokenExpiresAt);
   return i;
 }

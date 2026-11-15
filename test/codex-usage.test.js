@@ -21,6 +21,40 @@ test('normalizes Codex wham usage windows and model buckets', () => {
   assert.equal(usage.planType, 'pro');
 });
 
+// Plans differ in which windows they carry, so a window is filed by its own
+// length, with the same tolerance the header path uses — never by "anything
+// long is weekly". A monthly window is not a weekly one, and must not land in
+// the weekly bucket the selection gates on.
+test('a window that is neither five hours nor seven days is dropped, not misfiled', () => {
+  const monthly = normalizeCodexUsagePayload({
+    rate_limit: { primary_window: { used_percent: 40, limit_window_seconds: 2592000, reset_at: 1702000000 }, secondary_window: null },
+  });
+  assert.equal(monthly.sevenDay, null, 'a 30-day window is not weekly');
+  assert.equal(monthly.fiveHour, null);
+
+  const hourly = normalizeCodexUsagePayload({
+    rate_limit: { primary_window: { used_percent: 40, limit_window_seconds: 3600, reset_at: 1700000000 } },
+  });
+  assert.equal(hourly.fiveHour, null, 'a one-hour window is not the five-hour one');
+
+  // A monthly window listed first must not shadow the weekly one behind it.
+  const both = normalizeCodexUsagePayload({
+    rate_limit: {
+      primary_window: { used_percent: 90, limit_window_seconds: 2592000, reset_at: 1702000000 },
+      secondary_window: { used_percent: 40, limit_window_seconds: 604800, reset_at: 1700604800 },
+    },
+  });
+  assert.deepEqual(both.sevenDay, { utilization: 0.4, resetAt: 1700604800000 });
+});
+
+test('a weekly-only plan reads as weekly with no five-hour window', () => {
+  const usage = normalizeCodexUsagePayload({
+    rate_limit: { primary_window: { used_percent: 40, limit_window_seconds: 604800, reset_at: 1700604800 }, secondary_window: null },
+  });
+  assert.equal(usage.fiveHour, null);
+  assert.deepEqual(usage.sevenDay, { utilization: 0.4, resetAt: 1700604800000 });
+});
+
 // The shape a live subscription actually sends: a LIST whose entries name
 // themselves. `Object.entries` over it yields array indices, so before this was
 // handled every bucket was filed as "0" and "1" — names that identify nothing,
@@ -149,4 +183,41 @@ test('fetchCodexUsage preserves HTTP status for refresh-on-401', async () => {
     fetchImpl: async () => ({ ok: false, status: 401 }),
   });
   assert.deepEqual(result, { error: 'HTTP 401', status: 401 });
+});
+
+// The free rate-limit reset credits ride on this very payload, so reporting
+// what an account holds costs no request of its own. Two counts, kept apart:
+// `available` is the holdings, `applicable` is upstream's view of how many
+// would reset a window right now.
+test('reset-credit counts are read from the usage payload', () => {
+  const usage = normalizeCodexUsagePayload({
+    ...payload,
+    rate_limit_reset_credits: { available_count: 1, applicable_available_count: 0 },
+  });
+  assert.deepEqual(usage.resetCredits, { available: 1, applicable: 0 });
+});
+
+test('a payload that mentions no reset credits reports none rather than zero', () => {
+  assert.equal(normalizeCodexUsagePayload(payload).resetCredits, null);
+  assert.equal(normalizeCodexUsagePayload({ rate_limit_reset_credits: { available_count: 'lots' } }).resetCredits, null);
+});
+
+test('an unstated applicable count is null, not zero', () => {
+  const usage = normalizeCodexUsagePayload({ rate_limit_reset_credits: { available_count: 2 } });
+  assert.deepEqual(usage.resetCredits, { available: 2, applicable: null });
+});
+
+// The count is drawn as `RC<n>` on a width-budgeted TUI row, and it comes from a
+// private endpoint: whatever arrives has to leave as a small whole number.
+test('reset-credit counts are truncated and capped at two digits', () => {
+  const read = (available_count, applicable_available_count) =>
+    normalizeCodexUsagePayload({ rate_limit_reset_credits: { available_count, applicable_available_count } }).resetCredits;
+  assert.deepEqual(read(1.9, 1.2), { available: 1, applicable: 1 });
+  assert.deepEqual(read(1e9, 250), { available: 99, applicable: 99 });
+  assert.deepEqual(read('3', '0'), { available: 3, applicable: 0 });
+  // Not a count at all: dropped, never clamped into one.
+  assert.equal(read(Infinity, 1), null);
+  assert.equal(read(NaN, 1), null);
+  assert.equal(read(-1, 1), null);
+  assert.deepEqual(read(2, Infinity), { available: 2, applicable: null });
 });
