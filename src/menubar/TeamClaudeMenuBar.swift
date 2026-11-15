@@ -24,6 +24,12 @@ private struct Quota: Decodable {
     let unified7dSonnetReset: FlexibleDate?
     let unified7dFable: Double?
     let unified7dFableReset: FlexibleDate?
+    let sessionWindowStated: Bool?
+
+    /// Ultra (the former Max 20x) is losing its 5-hour limit account by
+    /// account, and the server records `sessionWindowStated: false` for an
+    /// account that meters none. Same rule as status-renderer.js.
+    var hasSessionWindow: Bool { sessionWindowStated != false || unified5h != nil }
 }
 
 private struct SwitchPayload: Decodable {
@@ -151,12 +157,17 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
         let quota = account.quota
         let fable = percent(quota?.unified7dFable)
-        let session = percent(quota?.unified5h)
         let weekly = percent(quota?.unified7d)
         let fableReset = resetSuffix(quota?.unified7dFableReset?.value)
-        let sessionReset = resetSuffix(quota?.unified5hReset?.value)
         let weeklyReset = resetSuffix(quota?.unified7dReset?.value)
-        statusItem.button?.title = "Fable: \(fable) \(fableReset) · Session: \(session) \(sessionReset) · Week: \(weekly) \(weeklyReset)"
+        var pieces = ["Fable: \(fable) \(fableReset)"]
+        if quota?.hasSessionWindow ?? true {
+            let session = percent(quota?.unified5h)
+            let sessionReset = resetSuffix(quota?.unified5hReset?.value)
+            pieces.append("Session: \(session) \(sessionReset)")
+        }
+        pieces.append("Week: \(weekly) \(weeklyReset)")
+        statusItem.button?.title = pieces.joined(separator: " · ")
         statusItem.button?.toolTip = "TeamClaude: lowest Fable usage is \(account.name)"
     }
 
@@ -268,7 +279,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private func quotaDetails(_ account: Account) -> [String] {
         guard let quota = account.quota else { return ["Quota unknown"] }
         var rows: [String] = []
-        appendQuota(&rows, label: "Session", used: quota.unified5h, reset: quota.unified5hReset?.value)
+        if quota.hasSessionWindow {
+            appendQuota(&rows, label: "Session", used: quota.unified5h, reset: quota.unified5hReset?.value)
+        }
         appendQuota(&rows, label: "Weekly", used: quota.unified7d, reset: quota.unified7dReset?.value)
         appendQuota(&rows, label: "Sonnet", used: quota.unified7dSonnet, reset: quota.unified7dSonnetReset?.value)
         appendQuota(&rows, label: "Fable", used: quota.unified7dFable, reset: quota.unified7dFableReset?.value)
